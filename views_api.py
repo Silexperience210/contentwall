@@ -1,5 +1,5 @@
 """
-ContentWall API routes - using ONLY old APIs compatible with all LNbits versions.
+ContentWall API routes.
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ contentwall_api_router = APIRouter()
 async def api_items(
     wallet: WalletTypeInfo = Depends(require_invoice_key),
     all_wallets: bool = Query(False),
-) -> list[Item]:
+):
     wallet_ids = [wallet.wallet.id]
     if all_wallets:
         from lnbits.core.crud import get_user
@@ -64,7 +64,7 @@ async def api_item_create(
     request: Request,
     data: CreateItem,
     wallet: WalletTypeInfo = Depends(require_admin_key),
-) -> Item:
+):
     if data.content_type not in ("article", "image"):
         raise HTTPException(HTTPStatus.BAD_REQUEST, "content_type must be 'article' or 'image'")
     if data.content_type == "article" and not data.article_content:
@@ -130,15 +130,15 @@ async def api_create_invoice(
         raise HTTPException(HTTPStatus.BAD_REQUEST, f"Minimum amount is {item.amount} {item.currency}")
 
     try:
-        payment = await create_invoice(
+        payment_hash, payment_request = await create_invoice(
             wallet_id=item.wallet,
             amount=amount,
             memo=item.memo,
             extra={"tag": "contentwall", "id": item_id},
         )
         return {
-            "payment_hash": payment.payment_hash,
-            "payment_request": payment.bolt11,
+            "payment_hash": payment_hash,
+            "payment_request": payment_request,
         }
     except Exception as exc:
         logger.error(f"Error creating invoice for item {item_id}: {exc}")
@@ -287,19 +287,11 @@ async def websocket_payment_status(
             incoming=True,
             wallet_id=item.wallet,
         )
-        if payment:
-            is_paid = False
-            try:
-                from lnbits.core.services import check_transaction_status
-                tx_status = await check_transaction_status(item.wallet, payment_hash)
-                is_paid = not tx_status.pending
-            except Exception:
-                is_paid = not payment.pending
-            if is_paid:
-                extra = _parse_payment_extra(payment)
-                if extra.get("tag") == "contentwall" and extra.get("id") == item_id:
-                    await ws.send_text(json.dumps({"paid": True}))
-                    return
+        if payment and not payment.pending:
+            extra = _parse_extra(payment)
+            if extra.get("tag") == "contentwall" and extra.get("id") == item_id:
+                await ws.send_text(json.dumps({"paid": True}))
+                return
 
         if await has_paid(item_id, payment_hash):
             await ws.send_text(json.dumps({"paid": True}))
@@ -326,7 +318,7 @@ async def websocket_payment_status(
             pass
 
 
-def _parse_payment_extra(payment) -> dict:
+def _parse_extra(payment) -> dict:
     """Parse payment.extra which can be dict, JSON string, or None."""
     extra = payment.extra
     if extra is None:
@@ -334,7 +326,6 @@ def _parse_payment_extra(payment) -> dict:
     if isinstance(extra, dict):
         return extra
     if isinstance(extra, str):
-        import json
         try:
             return json.loads(extra)
         except json.JSONDecodeError:
@@ -348,38 +339,21 @@ async def _is_payment_made(item: Item, payment_hash: str) -> int:
         return await get_payment_amount(item.id, payment_hash)
 
     try:
+        from lnbits.core.services import check_transaction_status
         from lnbits.core.crud import get_standalone_payment
-        payment = await get_standalone_payment(
-            checking_id_or_hash=payment_hash,
-            incoming=True,
-            wallet_id=item.wallet,
-        )
-        logger.info(f"_is_payment_made: payment found={payment is not None}, pending={payment.pending if payment else None}")
-        if not payment:
-            return 0
-
-        # Check if actually paid using check_transaction_status (checks node directly)
-        is_paid = False
-        try:
-            from lnbits.core.services import check_transaction_status
-            tx_status = await check_transaction_status(item.wallet, payment_hash)
-            is_paid = not tx_status.pending
-            logger.info(f"_is_payment_made: check_transaction_status pending={tx_status.pending}, is_paid={is_paid}")
-        except Exception:
-            # Fallback: use payment.pending
-            is_paid = not payment.pending
-            logger.info(f"_is_payment_made: fallback to payment.pending={payment.pending}, is_paid={is_paid}")
-
-        if is_paid:
-            extra = _parse_payment_extra(payment)
-            logger.info(f"_is_payment_made: extra={extra}")
-            if extra.get("tag") == "contentwall" and extra.get("id") == item.id:
-                amount_sats = int(payment.amount / 1000)
-                await record_payment(item.id, payment_hash, amount_sats)
-                logger.info(f"_is_payment_made: PAYMENT RECORDED {amount_sats} sats")
-                return amount_sats
-            else:
-                logger.warning(f"_is_payment_made: extra mismatch. Got tag={extra.get('tag')}, id={extra.get('id')}. Expected tag=contentwall, id={item.id}")
+        status = await check_transaction_status(item.wallet, payment_hash)
+        if not status.pending:
+            payment = await get_standalone_payment(
+                checking_id_or_hash=payment_hash,
+                incoming=True,
+                wallet_id=item.wallet,
+            )
+            if payment:
+                extra = _parse_extra(payment)
+                if extra.get("tag") == "contentwall" and extra.get("id") == item.id:
+                    amount_sats = int(payment.amount / 1000)
+                    await record_payment(item.id, payment_hash, amount_sats)
+                    return amount_sats
     except Exception as exc:
         logger.error(f"Error in _is_payment_made: {exc}")
 
@@ -391,28 +365,20 @@ async def _verify_access(item: Item, item_id: str, payment_hash: str) -> bool:
         return True
 
     try:
+        from lnbits.core.services import check_transaction_status
         from lnbits.core.crud import get_standalone_payment
-        payment = await get_standalone_payment(
-            checking_id_or_hash=payment_hash,
-            incoming=True,
-            wallet_id=item.wallet,
-        )
-        if not payment:
-            return False
-
-        is_paid = False
-        try:
-            from lnbits.core.services import check_transaction_status
-            tx_status = await check_transaction_status(item.wallet, payment_hash)
-            is_paid = not tx_status.pending
-        except Exception:
-            is_paid = not payment.pending
-
-        if is_paid:
-            extra = _parse_payment_extra(payment)
-            if extra.get("tag") == "contentwall" and extra.get("id") == item_id:
-                await record_payment(item_id, payment_hash, int(payment.amount / 1000))
-                return True
+        status = await check_transaction_status(item.wallet, payment_hash)
+        if not status.pending:
+            payment = await get_standalone_payment(
+                checking_id_or_hash=payment_hash,
+                incoming=True,
+                wallet_id=item.wallet,
+            )
+            if payment:
+                extra = _parse_extra(payment)
+                if extra.get("tag") == "contentwall" and extra.get("id") == item_id:
+                    await record_payment(item_id, payment_hash, int(payment.amount / 1000))
+                    return True
     except Exception as exc:
         logger.error(f"Error in _verify_access: {exc}")
 
