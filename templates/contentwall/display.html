@@ -1,0 +1,119 @@
+{% extends "public.html" %}
+
+{% block page %}
+<div class="row q-col-gutter-md justify-center">
+  <div class="col-12 col-sm-8 col-md-6 col-lg-5">
+    <q-card class="q-pa-lg q-mb-md bg-info" v-if="isScheduledPending">
+      <q-card-section class="text-center text-white">
+        <q-icon name="schedule" size="48px" class="q-mb-md"></q-icon>
+        <h5 class="text-h5 q-mt-none q-mb-sm">Coming Soon</h5>
+        <p>This content will be available on <strong v-text="scheduledDateFormatted"></strong></p>
+        <q-linear-progress indeterminate color="white" class="q-mt-md"></q-linear-progress>
+      </q-card-section>
+    </q-card>
+
+    <q-card class="q-pa-lg" v-if="!paid">
+      <q-card-section class="text-center">
+        <q-icon name="lock" size="48px" color="primary" class="q-mb-md"></q-icon>
+        <h5 class="text-h5 q-mt-none q-mb-sm" v-text="paywallTitle"></h5>
+        <p class="text-body2 text-grey q-mb-lg" v-show="paywallDescription" v-text="paywallDescription"></p>
+
+        <q-separator class="q-my-md"></q-separator>
+
+        <div class="q-mb-lg">
+          <q-badge color="primary" class="q-mb-sm" v-text="contentType === 'article' ? 'Article' : 'Image'"></q-badge>
+          <div class="text-caption text-grey">This content is hosted securely. Pay to unlock it.</div>
+          <q-badge v-if="releaseDelaySeconds > 0" color="orange" class="q-mt-sm">
+            <q-icon name="timer" size="xs" class="q-mr-xs"></q-icon>
+            Content appears <strong class="q-ml-xs" v-text="releaseDelaySeconds + 's'"></strong> after payment
+          </q-badge>
+        </div>
+
+        <q-form class="q-gutter-md">
+          <q-input filled v-model.number="userAmount" type="number" :min="paywallAmount"
+            :suffix="paywallCurrency" label="Amount *"
+            :hint="'Minimum ' + formattedAmount" class="q-mx-auto" style="max-width: 300px;"
+          ></q-input>
+
+          <q-btn unelevated color="primary"
+            :disable="userAmount < paywallAmount || paymentReq || loading || isScheduledPending"
+            @click="createInvoice()" :loading="loading" size="lg" class="q-mt-md full-width"
+          >
+            <q-icon name="bolt" class="q-mr-sm"></q-icon>
+            <span v-if="isScheduledPending">Not Yet Available</span>
+            <span v-else>Pay to Unlock</span>
+          </q-btn>
+        </q-form>
+
+        <div v-if="paymentReq" class="q-mt-lg">
+          <q-separator class="q-my-md"></q-separator>
+          <div class="text-subtitle2 q-mb-sm">Scan with Lightning wallet</div>
+          <lnbits-qrcode :value="paymentReq" :href="paymentReq" style="max-width: 250px; margin: 0 auto;"
+          ></lnbits-qrcode>
+          <div class="row q-mt-md justify-center q-gutter-sm">
+            <q-btn outline color="grey" @click="copyInvoice" icon="content_copy">Copy Invoice</q-btn>
+            <q-btn flat color="grey" @click="cancelPayment">Cancel</q-btn>
+          </div>
+          <div class="text-caption text-grey q-mt-sm">
+            Waiting for payment... <q-spinner size="1em"></q-spinner>
+          </div>
+        </div>
+      </q-card-section>
+    </q-card>
+
+    <q-card class="q-pa-lg text-center" v-if="paid && contentUnlocked">
+      <q-card-section class="text-center">
+        <q-icon name="check_circle" size="64px" color="positive" class="q-mb-md"></q-icon>
+        <h5 class="text-h5 q-mt-none q-mb-sm">Payment Successful!</h5>
+        <p class="text-body2 q-mb-lg">Your content is now unlocked.</p>
+
+        <q-btn unelevated color="primary" :href="contentUrl" size="lg" class="q-mb-md full-width">
+          <q-icon name="visibility" class="q-mr-sm"></q-icon>
+          View Content
+        </q-btn>
+
+        <q-btn v-if="onionUrl" outline color="deep-purple" :href="onionUrl" size="md" class="full-width"
+          icon="security"
+        >View via Tor</q-btn>
+
+        <div class="text-caption text-grey q-mt-sm">
+          <span v-if="remembers">This link remembers your payment. Bookmark it for later access.</span>
+          <span v-else>Keep this link safe.</span>
+        </div>
+      </q-card-section>
+    </q-card>
+
+    <q-card class="q-pa-lg text-center" v-if="paid && !contentUnlocked">
+      <q-card-section class="text-center">
+        <q-icon name="timer" size="64px" color="orange" class="q-mb-md"></q-icon>
+        <h5 class="text-h5 q-mt-none q-mb-sm">Payment Received!</h5>
+        <p class="text-body2 q-mb-lg">Content will appear in...</p>
+
+        <div class="text-h2 text-orange q-mb-lg" v-text="Math.ceil(unlockInSeconds) + 's'"></div>
+
+        <q-linear-progress :value="delayProgress" color="orange" size="20px" class="q-mb-md">
+          <div class="absolute-full flex flex-center">
+            <q-badge color="transparent" text-color="white" v-text="Math.round(delayProgress * 100) + '%'"></q-badge>
+          </div>
+        </q-linear-progress>
+
+        <q-btn unelevated color="orange" :href="contentUrl" :disable="unlockInSeconds > 0" size="lg" class="full-width">
+          <q-icon name="visibility" class="q-mr-sm"></q-icon>
+          View Content
+        </q-btn>
+
+        <div class="text-caption text-grey q-mt-md">
+          The creator set a <span v-text="releaseDelaySeconds"></span> second delay before content appears.
+        </div>
+      </q-card-section>
+    </q-card>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  const itemData = JSON.parse({{ item | tojson | safe }})
+</script>
+<script src="{{ static_url_for('contentwall/static', path='js/display.js') }}"></script>
+{% endblock %}

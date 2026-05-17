@@ -1,0 +1,58 @@
+{% extends "public.html" %}
+
+{% block page %}
+<div class="row q-col-gutter-md justify-center">
+  <div class="col-12 col-md-10 col-lg-8">
+    <q-card class="q-pa-lg">
+      <q-card-section>
+        <div class="row items-center q-mb-md">
+          <q-icon name="visibility" color="positive" size="32px" class="q-mr-md"></q-icon>
+          <div>
+            <div class="text-h5 q-mb-xs">{{ title }}</div>
+            <div class="text-caption text-grey">Unlocked content</div>
+          </div>
+        </div>
+
+        <q-separator class="q-my-md"></q-separator>
+
+        {% if description %}
+        <p class="text-body1 text-grey q-mb-lg">{{ description }}</p>
+        {% endif %}
+
+        {% if content_type == 'article' %}
+        <div class="article-content">
+          <div class="text-body1" style="line-height: 1.8; white-space: pre-wrap;">{{ article_content }}</div>
+        </div>
+        {% elif content_type == 'image' %}
+        <div class="image-content text-center">
+          <img src="{{ image_data }}" alt="{{ title }}" style="max-width: 100%; border-radius: 8px;" />
+        </div>
+        {% endif %}
+
+        <q-separator class="q-my-lg"></q-separator>
+
+        <div class="row items-center justify-between">
+          <div class="text-caption text-grey">
+            <q-icon name="security" size="xs" class="q-mr-xs"></q-icon>
+            Content secured by Lightning
+          </div>
+          <q-btn flat color="primary" icon="replay" size="sm" onclick="window.location.reload()">Refresh</q-btn>
+        </div>
+      </q-card-section>
+    </q-card>
+  </div>
+</div>
+{% endblock %}
+
+{% block styles %}
+<style>
+  .article-content {
+    background: rgba(128, 128, 128, 0.05);
+    border-radius: 8px;
+    padding: 24px;
+  }
+  .image-content img {
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+  }
+</style>
+{% endblock %}

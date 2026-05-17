@@ -1,0 +1,20 @@
+[project]
+name = "lnbits-contentwall"
+version = "1.0.10"
+requires-python = ">=3.10,<3.13"
+description = "LNbits extension for real paywalls with server-hosted content"
+authors = [{ name = "Silexperience" }]
+license = "MIT"
+readme = "README.md"
+urls = { Homepage = "https://github.com/Silexperience210/contentwall", Repository = "https://github.com/Silexperience210/contentwall" }
+
+dependencies = [ "lnbits>1" ]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+
+[tool.mypy]
+ignore_missing_imports = true

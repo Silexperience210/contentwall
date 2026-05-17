@@ -1,0 +1,15 @@
+{
+  "name": "ContentWall",
+  "short_description": "Real paywall with server-hosted content",
+  "tile": "/contentwall/static/image.png",
+  "min_lnbits_version": "1.0.0",
+  "contributors": [
+    {
+      "name": "Silexperience",
+      "uri": "https://github.com/Silexperience210",
+      "role": "Developer"
+    }
+  ],
+  "description_md": "https://raw.githubusercontent.com/Silexperience210/contentwall/main/description.md",
+  "license": "MIT"
+}
