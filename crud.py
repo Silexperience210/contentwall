@@ -33,9 +33,12 @@ def _resolve_files_dir() -> str:
 FILES_DIR = _resolve_files_dir()
 
 
-def _guess_mime_from_magic(file_path: str) -> str:
-    with open(file_path, "rb") as f:
-        header = f.read(16)
+def guess_mime_from_bytes(header: bytes) -> str:
+    """
+    Identify common media types from the first ~16 bytes. Used for both
+    pre-write validation (UploadFile) and on-disk lookup (.bin fallback).
+    Public name (no underscore) so views_api.py can import it cleanly.
+    """
     if header.startswith(b"\xff\xd8\xff"):
         return "image/jpeg"
     if header.startswith(b"\x89PNG\r\n\x1a\n"):
@@ -55,6 +58,13 @@ def _guess_mime_from_magic(file_path: str) -> str:
     if header.startswith(b"\x1a\x45\xdf\xa3"):
         return "video/webm"
     return "application/octet-stream"
+
+
+def _guess_mime_from_magic(file_path: str) -> str:
+    """Path-based wrapper for backward compatibility."""
+    with open(file_path, "rb") as f:
+        header = f.read(16)
+    return guess_mime_from_bytes(header)
 
 
 def _ensure_files_dir():
@@ -220,24 +230,76 @@ async def store_article_content(item_id: str, content: str) -> None:
 
 
 async def store_image_file(item_id: str, upload_file) -> dict:
+    """
+    Persist an uploaded image. The client-provided content_type is *not* trusted
+    (mobile pickers often send 'application/octet-stream' or 'image/*'); the real
+    MIME is derived from the file's magic bytes. The extension on disk matches the
+    detected MIME so the existing extension-based lookup in get_image_file_info
+    finds the file directly without falling back to .bin + magic re-detection.
+    """
     _ensure_files_dir()
-    file_ext = os.path.splitext(upload_file.filename or "")[1].lower()
-    if file_ext not in [".jpg", ".jpeg", ".png", ".gif", ".webp"]:
-        ct = (upload_file.content_type or "").lower()
+
+    content = await upload_file.read()
+    if not content:
+        raise ValueError("Uploaded file is empty")
+
+    # Detect real MIME from magic bytes (authoritative)
+    real_mime = guess_mime_from_bytes(content[:16])
+    image_mimes = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+
+    if real_mime in image_mimes:
         ext_map = {
             "image/jpeg": ".jpg",
             "image/png": ".png",
             "image/gif": ".gif",
             "image/webp": ".webp",
         }
-        file_ext = ext_map.get(ct, ".bin")
+        file_ext = ext_map[real_mime]
+        effective_mime = real_mime
+    else:
+        # Magic bytes don't say image. Try to recover from the filename
+        # before giving up — some Android cameras strip headers we don't know.
+        fn_ext = os.path.splitext(upload_file.filename or "")[1].lower()
+        if fn_ext in (".jpg", ".jpeg"):
+            file_ext, effective_mime = ".jpg", "image/jpeg"
+        elif fn_ext == ".png":
+            file_ext, effective_mime = ".png", "image/png"
+        elif fn_ext == ".gif":
+            file_ext, effective_mime = ".gif", "image/gif"
+        elif fn_ext == ".webp":
+            file_ext, effective_mime = ".webp", "image/webp"
+        else:
+            raise ValueError(
+                f"File doesn't look like a supported image "
+                f"(magic={real_mime}, filename={upload_file.filename!r}, "
+                f"client_mime={upload_file.content_type!r}). "
+                f"Supported: JPEG, PNG, GIF, WebP."
+            )
+
     file_path = os.path.join(FILES_DIR, f"{item_id}{file_ext}")
-    logger.info(f"[store_image_file] item_id={item_id} ext={file_ext} path={file_path}")
-    content = await upload_file.read()
+    logger.info(
+        f"[store_image_file] item_id={item_id} ext={file_ext} "
+        f"mime={effective_mime} client_mime={upload_file.content_type!r} "
+        f"path={file_path}"
+    )
+
+    # Clean up any stale file from a previous upload for this item under any
+    # other extension — otherwise get_image_file_info might pick the wrong one.
+    for stale_ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bin"):
+        if stale_ext == file_ext:
+            continue
+        stale = os.path.join(FILES_DIR, f"{item_id}{stale_ext}")
+        if os.path.exists(stale):
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
+
     content_hash = _hash_content(content)
     with open(file_path, "wb") as f:
         f.write(content)
     logger.info(f"[store_image_file] written {len(content)} bytes to {file_path}")
+
     await db.execute(
         "UPDATE contentwall.items SET content_hash = :hash WHERE id = :id",
         {"hash": content_hash, "id": item_id},
@@ -246,7 +308,7 @@ async def store_image_file(item_id: str, upload_file) -> dict:
         "file_path": file_path,
         "content_hash": content_hash,
         "size": len(content),
-        "content_type": upload_file.content_type or "application/octet-stream",
+        "content_type": effective_mime,
     }
 
 

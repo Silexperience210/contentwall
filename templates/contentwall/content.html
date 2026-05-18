@@ -118,8 +118,23 @@
 
         {% elif content_type == 'image' %}
         <div class="image-content text-center">
-          {% if image_data %}
-          <img src="{{ image_data }}" alt="{{ title }}" />
+          {% if image_url %}
+          <img src="{{ image_url }}" alt="{{ title }}"
+               onerror="cwHandleImgError(this)" />
+          <div id="cw-img-error" style="display: none;" class="q-mt-md">
+            <p class="text-negative">
+              <q-icon name="error_outline" class="q-mr-xs"></q-icon>
+              Image could not be loaded.
+            </p>
+            <q-btn outline color="orange" size="sm" no-caps
+                   @click="window.cwImgDiag()">
+              Run diagnostic
+            </q-btn>
+            <pre id="cw-img-diag-output" style="display: none; text-align: left;
+                 background: rgba(0,0,0,0.4); padding: 12px; border-radius: 6px;
+                 margin-top: 12px; font-size: 11px; color: #ffb070;
+                 max-height: 240px; overflow: auto;"></pre>
+          </div>
           {% else %}
           <p class="text-negative">Image unavailable</p>
           {% endif %}
@@ -205,6 +220,31 @@
 <script>
 const ITEM_ID      = "{{ item_id }}";
 const PAYMENT_HASH = "{{ payment_hash }}";
+const ACCESS_TOKEN = "{{ access_token }}";
+
+function cwHandleImgError(imgEl) {
+  imgEl.style.display = 'none';
+  const errBox = document.getElementById('cw-img-error');
+  if (errBox) errBox.style.display = 'block';
+}
+
+window.cwImgDiag = async function() {
+  const out = document.getElementById('cw-img-diag-output');
+  if (!out) return;
+  out.style.display = 'block';
+  out.textContent = 'Running diagnostic...';
+  try {
+    const r = await fetch(
+      `/contentwall/api/v1/items/${ITEM_ID}/diagnostic` +
+      `?payment_hash=${encodeURIComponent(PAYMENT_HASH)}` +
+      `&t=${encodeURIComponent(ACCESS_TOKEN)}`
+    );
+    const data = await r.json();
+    out.textContent = JSON.stringify(data, null, 2);
+  } catch (err) {
+    out.textContent = 'Diagnostic failed: ' + err.message;
+  }
+};
 
 async function cwTip() {
   const amountEl = document.getElementById('cw-tip-amount');

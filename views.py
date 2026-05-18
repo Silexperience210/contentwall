@@ -200,7 +200,7 @@ async def view_content(
 
     article_content = None
     article_html = None
-    image_data = None
+    image_url = None
     bundle_files = []
     media_url = None
     media_mime = None
@@ -210,13 +210,14 @@ async def view_content(
             article_html = render_markdown_safe(article_content)
     elif item.content_type == "image":
         from loguru import logger
-        logger.info(f"[content_view] item_id={item_id} loading image")
-        img = await get_image_base64(item_id)
-        if img:
-            image_data = f"data:{img['content_type']};base64,{img['data']}"
-            logger.info(f"[content_view] image loaded, mime={img['content_type']} len={len(img['data'])}")
-        else:
-            logger.warning(f"[content_view] image_data is None for item_id={item_id}")
+        logger.info(f"[content_view] item_id={item_id} building image URL")
+        # Serve the image via the streaming endpoint instead of inlining a
+        # multi-MB base64 blob in the HTML. The streaming endpoint also
+        # applies the per-buyer watermark (PIL permitting).
+        image_url = (
+            f"/contentwall/api/v1/items/image/{item_id}"
+            f"?payment_hash={payment_hash}&t={t or ''}"
+        )
     elif item.content_type == "bundle":
         bundle_files = [
             {
@@ -248,7 +249,7 @@ async def view_content(
             "article_content": article_content,
             "article_html": article_html,
             "use_markdown": bool(item.markdown),
-            "image_data": image_data,
+            "image_url": image_url,
             "bundle_files": bundle_files,
             "media_url": media_url,
             "media_mime": media_mime,

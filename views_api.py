@@ -235,16 +235,21 @@ async def api_upload_image(
             HTTPStatus.BAD_REQUEST, "Item is not an image type"
         )
 
-    allowed = {"image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp"}
-    if (upload_file.content_type or "") not in allowed:
-        logger.warning(f"[api_upload_image] rejected mime type: {upload_file.content_type}")
-        raise HTTPException(
-            HTTPStatus.BAD_REQUEST,
-            "Invalid file type. Allowed: JPEG, PNG, GIF, WebP",
-        )
+    # NOTE: client-provided content_type is NOT trusted. Mobile pickers and
+    # some Android browsers send 'application/octet-stream' or 'image/*' even
+    # for valid JPEG/PNG files. We let store_image_file validate by reading
+    # the magic bytes — that's both safer (can't be spoofed by a header) and
+    # more permissive (works with whatever the client actually sends).
+    try:
+        result = await store_image_file(item_id, upload_file)
+    except ValueError as exc:
+        logger.warning(f"[api_upload_image] rejected by magic-byte check: {exc}")
+        raise HTTPException(HTTPStatus.BAD_REQUEST, str(exc))
 
-    result = await store_image_file(item_id, upload_file)
-    logger.info(f"[api_upload_image] success item_id={item_id} size={result['size']}")
+    logger.info(
+        f"[api_upload_image] success item_id={item_id} "
+        f"size={result['size']} stored_mime={result['content_type']}"
+    )
     return {
         "success": True,
         "size": result["size"],
@@ -647,6 +652,119 @@ async def api_debug_payment(item_id: str, payment_hash: str):
 # ---------------------------------------------------------------------------
 
 
+def _placeholder_svg(label: str) -> str:
+    """
+    Return a small inline SVG data URI used as a graceful fallback when a
+    real image preview can't be generated (no Pillow, missing upload, ...).
+    Sized 480x300 to match the blurred-preview aspect when displayed in the
+    paywall card.
+    """
+    import base64 as _b64
+
+    safe_label = (
+        label.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    )
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 300">'
+        '<defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1">'
+        '<stop offset="0" stop-color="#1a1320"/>'
+        '<stop offset="1" stop-color="#0a0814"/>'
+        "</linearGradient></defs>"
+        '<rect width="480" height="300" fill="url(#g)"/>'
+        '<rect x="2" y="2" width="476" height="296" fill="none" '
+        'stroke="#ff6b00" stroke-opacity="0.45" stroke-width="2" rx="6"/>'
+        '<text x="240" y="155" text-anchor="middle" '
+        'font-family="monospace" font-size="20" fill="#ff6b00">'
+        f"{safe_label}</text>"
+        '<text x="240" y="185" text-anchor="middle" '
+        'font-family="monospace" font-size="11" fill="#b9aeb6">'
+        "// preview unavailable</text>"
+        "</svg>"
+    )
+    encoded = _b64.b64encode(svg.encode("utf-8")).decode("ascii")
+    return f"data:image/svg+xml;base64,{encoded}"
+
+
+@contentwall_api_router.get("/api/v1/items/{item_id}/diagnostic")
+async def api_item_diagnostic(
+    item_id: str,
+    payment_hash: str = Query(""),
+    t: str = Query(""),
+):
+    """
+    Self-service diagnostic for the most common failure modes (missing file,
+    wrong extension on disk, PIL missing). Safe to expose: only returns paths
+    and booleans, never image bytes. Requires a valid paid+token combo OR no
+    parameters (in which case file existence is reported without content).
+    """
+    import os as _os
+
+    item = await get_item(item_id)
+    if not item:
+        raise HTTPException(HTTPStatus.NOT_FOUND, "Item not found")
+
+    # If the caller passes payment_hash + t and they verify, they get extra
+    # detail; otherwise just the basics so anyone can self-diagnose.
+    detailed = False
+    if payment_hash and t:
+        try:
+            detailed = await _verify_access(item, item_id, payment_hash, t)
+        except Exception:
+            detailed = False
+
+    from .crud import FILES_DIR as _FD
+
+    info_image = await get_image_file_info(item_id)
+    info_media = await get_media_file_info(item_id)
+
+    # Inventory of every file on disk for this item id (regardless of ext)
+    matching_files = []
+    try:
+        if _os.path.isdir(_FD):
+            for name in _os.listdir(_FD):
+                if name.startswith(item_id + "."):
+                    fp = _os.path.join(_FD, name)
+                    if _os.path.isfile(fp):
+                        matching_files.append({
+                            "name": name,
+                            "size": _os.path.getsize(fp),
+                        })
+    except Exception as exc:
+        matching_files.append({"error": str(exc)})
+
+    try:
+        from PIL import Image  # noqa: F401
+        pil_available = True
+    except Exception:
+        pil_available = False
+
+    out = {
+        "item_id": item_id,
+        "content_type": item.content_type,
+        "content_hash_db": item.content_hash,
+        "files_dir": _FD,
+        "files_dir_exists": _os.path.isdir(_FD),
+        "matching_files_on_disk": matching_files,
+        "image_lookup": (
+            None if not info_image else {
+                "path": info_image["file_path"],
+                "content_type": info_image["content_type"],
+                "size": info_image["size"],
+            }
+        ),
+        "media_lookup": (
+            None if not info_media else {
+                "path": info_media["file_path"],
+                "content_type": info_media["content_type"],
+                "size": info_media["size"],
+            }
+        ),
+        "pil_available": pil_available,
+        "authenticated": detailed,
+    }
+    return out
+
+
 @contentwall_api_router.get("/api/v1/items/{item_id}/preview")
 async def api_get_preview(item_id: str):
     """
@@ -673,14 +791,25 @@ async def api_get_preview(item_id: str):
     if item.content_type == "image":
         info = await get_image_file_info(item_id)
         if not info:
-            return {"content_type": "image", "preview_data": None}
-        blurred = make_blurred_preview(info["file_path"])
-        if blurred is None:
-            # No PIL, no preview available
+            # No file on disk — surface this explicitly so the UI can show a
+            # 'missing upload' placeholder rather than rendering an empty div.
             return {
                 "content_type": "image",
-                "preview_data": None,
+                "preview_data": _placeholder_svg("Image not uploaded"),
                 "teaser_text": item.teaser_text,
+                "file_missing": True,
+            }
+        blurred = make_blurred_preview(info["file_path"])
+        if blurred is None:
+            # PIL not installed: serve a placeholder so the user still sees
+            # something on the paywall card. README recommends installing
+            # Pillow for a true blurred teaser.
+            return {
+                "content_type": "image",
+                "preview_data": _placeholder_svg("🔒 Locked image"),
+                "teaser_text": item.teaser_text,
+                "file_missing": False,
+                "pil_missing": True,
             }
         import base64
         return {
@@ -784,6 +913,12 @@ async def api_get_content(
             response["image_data"] = (
                 f"data:{img['content_type']};base64,{img['data']}"
             )
+        # Always include a streaming URL too — clients should prefer this
+        # over the embedded base64 (smaller payload, watermark applied).
+        response["image_url"] = (
+            f"/contentwall/api/v1/items/image/{item_id}"
+            f"?payment_hash={payment_hash}&t={t or ''}"
+        )
     elif item.content_type == "bundle":
         files = await get_item_files(item_id)
         response["files"] = [
@@ -877,9 +1012,8 @@ async def api_get_bundle_file(
         raise HTTPException(HTTPStatus.NOT_FOUND, "File not found")
 
     import os as _os
-    file_path = _os.path.join(
-        "data", "contentwall", "files", "bundles", item_id, bf.id
-    )
+    from .crud import FILES_DIR as _FD
+    file_path = _os.path.join(_FD, "bundles", item_id, bf.id)
     if not _os.path.exists(file_path):
         raise HTTPException(HTTPStatus.NOT_FOUND, "File missing on disk")
 
