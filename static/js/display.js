@@ -1,8 +1,11 @@
 /**
- * ContentWall Public Display Page JavaScript (v1.1.0)
+ * ContentWall Public Display Page JavaScript (v1.2.0)
  *
- * Adds: preview fetch, LNURL copy, rental expiry display, view counter,
- * graceful fallback from websocket -> polling.
+ * Adds since v1.1.0:
+ *   - Coupon application (with live discount preview)
+ *   - Audio / video preview info
+ *   - Purchase recording in localStorage for /me/purchases
+ *   - Embed-mode aware (skips redirect, keeps content inline)
  */
 
 window.app = Vue.createApp({
@@ -30,7 +33,6 @@ window.app = Vue.createApp({
       preview: null,
       lnurl: null,
 
-      // Time & scheduling
       releaseDelaySeconds: item.release_delay_seconds || 0,
       scheduledAt: item.scheduled_at || null,
       contentUnlocked: true,
@@ -38,11 +40,17 @@ window.app = Vue.createApp({
       delayProgress: 0,
       countdownInterval: null,
 
-      // v1.1.0
       accessDurationSeconds: item.access_duration_seconds || 0,
       maxViews: item.max_views || 0,
       viewsCount: 0,
       expiresAt: null,
+
+      // v1.2.0
+      couponInput: '',
+      couponLoading: false,
+      couponError: '',
+      appliedCoupon: null,    // {code, original_amount, discounted_amount, savings}
+      discountedAmount: null, // computed effective amount when coupon applied
     };
   },
 
@@ -66,16 +74,17 @@ window.app = Vue.createApp({
       if (s >= 60)    return Math.round(s / 60)    + 'm';
       return s + 's';
     },
+    effectiveAmount() {
+      return this.discountedAmount !== null ? this.discountedAmount : this.paywallAmount;
+    },
   },
 
   async mounted() {
-    // Fetch teaser/preview
     try {
       const r = await fetch(`/contentwall/api/v1/items/${this.itemId}/preview`);
       if (r.ok) this.preview = await r.json();
     } catch (_) {}
 
-    // Fetch LNURL
     try {
       const r2 = await fetch(`/contentwall/api/v1/lnurlp/${this.itemId}/encoded`);
       if (r2.ok) {
@@ -84,7 +93,6 @@ window.app = Vue.createApp({
       }
     } catch (_) {}
 
-    // Maybe a payment_hash is already in the URL (return visitor)
     const urlParams = new URLSearchParams(window.location.search);
     const ph = urlParams.get('payment_hash');
     if (ph) {
@@ -102,19 +110,59 @@ window.app = Vue.createApp({
       if (this.countdownInterval) { clearInterval(this.countdownInterval); this.countdownInterval = null; }
     },
 
+    async applyCoupon() {
+      this.couponError = '';
+      const code = (this.couponInput || '').trim().toUpperCase();
+      if (!code) return;
+      this.couponLoading = true;
+      try {
+        const r = await fetch(`/contentwall/api/v1/items/${this.itemId}/coupons/check/${encodeURIComponent(code)}`);
+        if (!r.ok) {
+          this.couponError = 'Could not verify coupon';
+          return;
+        }
+        const d = await r.json();
+        if (!d.valid) {
+          this.couponError = d.reason || 'Invalid code';
+          this.discountedAmount = null;
+          this.appliedCoupon = null;
+          return;
+        }
+        this.discountedAmount = d.discounted_amount;
+        this.appliedCoupon = { code, ...d };
+        if (this.userAmount < d.discounted_amount) this.userAmount = d.discounted_amount;
+        this.couponError = '';
+      } catch (err) {
+        this.couponError = 'Network error';
+      } finally {
+        this.couponLoading = false;
+      }
+    },
+
+    clearCoupon() {
+      this.discountedAmount = null;
+      this.appliedCoupon = null;
+      this.couponInput = '';
+      this.couponError = '';
+      if (this.userAmount < this.paywallAmount) this.userAmount = this.paywallAmount;
+    },
+
     async createInvoice() {
       if (this.isScheduledPending) {
-        this.$q.notify({ type: 'warning', message: 'This content is not yet available for purchase' });
+        this.$q.notify({ type: 'warning', message: 'Not yet available' });
         return;
       }
       this.loading = true;
       try {
+        const body = { amount: this.userAmount };
+        if (this.appliedCoupon) body.coupon_code = this.appliedCoupon.code;
+
         const resp = await fetch(
           `/contentwall/api/v1/items/invoice/${this.itemId}`,
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ amount: this.userAmount }),
+            body: JSON.stringify(body),
           },
         );
         if (!resp.ok) {
@@ -141,12 +189,27 @@ window.app = Vue.createApp({
         const data = JSON.parse(event.data);
         if (data.paid) this.onPaymentSuccess();
       };
-
       this.ws.onerror = () => {
-        // Fall back to polling
         this.pollInterval = setInterval(() => this.checkPayment(), 4000);
       };
-      this.ws.onclose = () => {};
+    },
+
+    recordPurchaseLocally() {
+      try {
+        const key = 'contentwall.purchases';
+        const arr = JSON.parse(localStorage.getItem(key) || '[]');
+        if (!arr.find(p => p.payment_hash === this.paymentHash)) {
+          arr.push({
+            payment_hash: this.paymentHash,
+            item_id: this.itemId,
+            title: this.paywallTitle,
+            saved_at: new Date().toISOString(),
+          });
+          localStorage.setItem(key, JSON.stringify(arr));
+        }
+      } catch (_) {
+        // localStorage may be disabled (private mode) — non-fatal.
+      }
     },
 
     async checkPayment() {
@@ -176,10 +239,12 @@ window.app = Vue.createApp({
           this.maxViews = data.max_views || this.maxViews;
 
           this.cleanup();
+          this.recordPurchaseLocally();
 
           if (!this.expired && !this.contentUnlocked && this.unlockInSeconds > 0) {
             this.startCountdown();
-          } else if (!this.expired) {
+          } else if (!this.expired && !EMBED_MODE) {
+            // Embed mode: stay on the embedded card; let user click through
             setTimeout(() => { if (this.contentUrl) window.location.href = this.contentUrl; }, 1500);
           }
         }
@@ -205,7 +270,7 @@ window.app = Vue.createApp({
           clearInterval(this.countdownInterval);
           this.contentUnlocked = true;
           this.delayProgress = 1;
-          if (this.contentUrl) window.location.href = this.contentUrl;
+          if (this.contentUrl && !EMBED_MODE) window.location.href = this.contentUrl;
         }
       }, 1000);
     },
@@ -229,4 +294,3 @@ window.app = Vue.createApp({
 });
 
 // IMPORTANT: do NOT call window.app.use(Quasar) or window.app.mount('#vue').
-// LNbits' core init-app.js runs AFTER this script and does both itself.

@@ -122,3 +122,56 @@ async def m002_extended_fields(db: Connection):
     await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_contentwall_files_item ON item_files(item_id, position);"
     )
+
+
+async def m003_distribution_features(db: Connection):
+    """
+    v1.2.0 schema additions:
+
+    * Markdown rendering toggle       -> items.markdown
+    * Tip jar (post-purchase tips)    -> items.allow_tips
+                                         + new table tips
+    * Discount codes / coupons        -> new table coupons
+                                         + payments.coupon_code (audit)
+    * Embed widget tracking           -> nothing in DB
+    * Audio / video content types     -> just a content_type='audio'|'video' string
+    """
+    await _add_column_if_missing(db, "items", "markdown", "INTEGER DEFAULT 0")
+    await _add_column_if_missing(db, "items", "allow_tips", "INTEGER DEFAULT 1")
+    await _add_column_if_missing(db, "payments", "coupon_code", "TEXT")
+
+    await db.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS contentwall.coupons (
+            id TEXT PRIMARY KEY,
+            item_id TEXT NOT NULL,
+            code TEXT NOT NULL,
+            discount_percent INTEGER DEFAULT 0,
+            discount_fixed_sats {db.big_int} DEFAULT 0,
+            uses_remaining INTEGER DEFAULT -1,
+            uses_count INTEGER DEFAULT 0,
+            expires_at TIMESTAMP,
+            created_at TIMESTAMP NOT NULL DEFAULT {db.timestamp_now}
+        );
+        """
+    )
+    await db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_contentwall_coupons_code ON coupons(item_id, code);"
+    )
+
+    await db.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS contentwall.tips (
+            id TEXT PRIMARY KEY,
+            item_id TEXT NOT NULL,
+            paywall_payment_hash TEXT,
+            tip_payment_hash TEXT NOT NULL,
+            amount_sats {db.big_int} NOT NULL,
+            paid_at TIMESTAMP,
+            created_at TIMESTAMP NOT NULL DEFAULT {db.timestamp_now}
+        );
+        """
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_contentwall_tips_item ON tips(item_id);"
+    )

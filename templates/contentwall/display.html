@@ -1,5 +1,15 @@
 {% extends "public.html" %}
 
+{% block head %}
+<meta property="og:title" content="{{ og_title }}">
+<meta property="og:description" content="{{ og_description }}">
+<meta property="og:url" content="{{ public_url }}">
+<meta property="og:type" content="article">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{{ og_title }}">
+<meta name="twitter:description" content="{{ og_description }}">
+{% endblock %}
+
 {% block styles %}
 <style>
   :root {
@@ -9,14 +19,23 @@
     --cw-glow-strong: 0 0 36px rgba(255, 107, 0, 0.55);
   }
   body { background: radial-gradient(ellipse at top, #1a1320 0%, #0a0814 70%); }
+  body.cw-embed-body {
+    background: transparent;
+    margin: 0;
+    padding: 0;
+  }
+  body.cw-embed-body .q-page-container { padding: 0 !important; }
+  body.cw-embed-body .q-header,
+  body.cw-embed-body .q-drawer,
+  body.cw-embed-body .q-footer { display: none !important; }
+
   .cw-card {
     background: linear-gradient(160deg, rgba(40,20,30,0.85), rgba(15,10,20,0.95));
     border: 1px solid rgba(255, 107, 0, 0.25);
     box-shadow: var(--cw-glow);
     color: #f5f1e8;
   }
-  .cw-card .text-grey,
-  .cw-card .text-caption { color: #b9aeb6 !important; }
+  .cw-card .text-grey, .cw-card .text-caption { color: #b9aeb6 !important; }
   .cw-title { font-family: monospace; letter-spacing: 0.04em; }
   .cw-amount {
     font-family: monospace;
@@ -60,21 +79,36 @@
     box-shadow: 0 0 6px var(--cw-orange);
     margin-right: 8px;
   }
-  .cw-pulse {
-    animation: cw-pulse 1.4s ease-in-out infinite;
-  }
+  .cw-pulse { animation: cw-pulse 1.4s ease-in-out infinite; }
   @keyframes cw-pulse {
     0%, 100% { opacity: 0.55; }
     50%       { opacity: 1; }
   }
+  .cw-coupon-row {
+    display: flex; gap: 8px; align-items: center;
+    margin-top: 8px;
+  }
+  .cw-coupon-row input {
+    flex: 1;
+    background: rgba(0,0,0,0.3);
+    border: 1px solid rgba(255,107,0,0.25);
+    border-radius: 4px;
+    padding: 6px 10px;
+    color: #f5f1e8;
+    font-family: monospace;
+    text-transform: uppercase;
+  }
 </style>
+{% if embed_mode %}
+<script>document.body && document.body.classList.add('cw-embed-body');
+document.addEventListener('DOMContentLoaded', () => document.body.classList.add('cw-embed-body'));</script>
+{% endif %}
 {% endblock %}
 
 {% block page %}
 <div class="row q-col-gutter-md justify-center q-pa-md">
   <div class="col-12 col-sm-9 col-md-7 col-lg-5">
 
-    <!-- Scheduled (not yet released) -->
     <q-card class="cw-card q-pa-lg q-mb-md" v-if="isScheduledPending">
       <q-card-section class="text-center">
         <q-icon name="schedule" size="48px" style="color: var(--cw-orange);" class="q-mb-md"></q-icon>
@@ -84,7 +118,6 @@
       </q-card-section>
     </q-card>
 
-    <!-- Paywall view -->
     <q-card class="cw-card q-pa-lg" v-if="!paid">
       <q-card-section>
         <div class="row items-center q-mb-md">
@@ -95,7 +128,6 @@
           </div>
         </div>
 
-        <!-- Teaser -->
         <div v-if="preview" class="q-mt-md q-mb-md">
           <div class="text-caption q-mb-xs">
             <span class="cw-bullet"></span>PREVIEW
@@ -114,9 +146,18 @@
               </li>
             </ul>
           </div>
+          <div v-else-if="preview.content_type === 'audio'" class="cw-teaser-article">
+            <q-icon name="music_note" style="color: var(--cw-orange);" class="q-mr-xs"></q-icon>
+            Audio file · <span v-text="(preview.media_size / (1024*1024)).toFixed(1) + ' MB'"></span>
+            <div v-if="preview.teaser_text" class="q-mt-sm" v-text="preview.teaser_text"></div>
+          </div>
+          <div v-else-if="preview.content_type === 'video'" class="cw-teaser-article">
+            <q-icon name="movie" style="color: var(--cw-orange);" class="q-mr-xs"></q-icon>
+            Video file · <span v-text="(preview.media_size / (1024*1024)).toFixed(1) + ' MB'"></span>
+            <div v-if="preview.teaser_text" class="q-mt-sm" v-text="preview.teaser_text"></div>
+          </div>
         </div>
 
-        <!-- Badges row -->
         <div class="row q-gutter-xs q-my-md">
           <q-badge outline color="orange" v-text="contentType.toUpperCase()"></q-badge>
           <q-badge outline color="orange" v-if="releaseDelaySeconds > 0">
@@ -130,27 +171,38 @@
           </q-badge>
         </div>
 
-        <!-- Amount + CTA -->
         <q-form class="q-gutter-md q-mt-md">
           <div class="text-center">
             <div class="text-caption">PRICE</div>
             <div class="text-h3 cw-amount">
-              <span v-text="paywallAmount"></span>
+              <span v-if="discountedAmount !== null" style="text-decoration: line-through; font-size: 0.5em; opacity: 0.5;"
+                v-text="paywallAmount + ' ' + paywallCurrency"></span>
+              <br v-if="discountedAmount !== null">
+              <span v-text="effectiveAmount"></span>
               <span class="text-h5" v-text="' ' + paywallCurrency"></span>
+            </div>
+            <div v-if="discountedAmount !== null" class="text-caption" style="color: #22c55e;">
+              Coupon applied! You save <span v-text="(paywallAmount - effectiveAmount)"></span> sats
             </div>
           </div>
 
+          <div class="cw-coupon-row">
+            <input v-model="couponInput" placeholder="COUPON CODE (optional)" maxlength="64" />
+            <q-btn outline color="orange" size="sm" no-caps @click="applyCoupon"
+              :loading="couponLoading">Apply</q-btn>
+            <q-btn v-if="discountedAmount !== null" flat color="negative" size="sm" no-caps
+              @click="clearCoupon">×</q-btn>
+          </div>
+          <div v-if="couponError" class="text-caption" style="color: #ff2a45;" v-text="couponError"></div>
+
           <q-input filled dark dense v-model.number="userAmount" type="number"
-            :min="paywallAmount" :suffix="paywallCurrency"
+            :min="effectiveAmount" :suffix="paywallCurrency"
             label="Custom amount (≥ minimum)"
-            :hint="'Tip the creator if you want — minimum is ' + paywallAmount + ' ' + paywallCurrency"
-            class="q-mx-auto" style="max-width: 320px;"
-          ></q-input>
+            class="q-mx-auto" style="max-width: 320px;"></q-input>
 
           <q-btn class="cw-cta full-width q-mt-md" size="lg" no-caps unelevated
-            :disable="userAmount < paywallAmount || paymentReq || loading || isScheduledPending"
-            @click="createInvoice()" :loading="loading"
-          >
+            :disable="userAmount < effectiveAmount || paymentReq || loading || isScheduledPending"
+            @click="createInvoice()" :loading="loading">
             <q-icon name="bolt" class="q-mr-sm"></q-icon>
             <span v-if="isScheduledPending">// NOT YET AVAILABLE</span>
             <span v-else>// PAY TO UNLOCK</span>
@@ -164,7 +216,6 @@
           </div>
         </q-form>
 
-        <!-- Invoice -->
         <div v-if="paymentReq" class="q-mt-lg">
           <q-separator dark class="q-my-md" style="background: rgba(255,107,0,0.3);"></q-separator>
           <div class="text-subtitle2 q-mb-sm text-center">
@@ -186,7 +237,6 @@
       </q-card-section>
     </q-card>
 
-    <!-- Unlocked -->
     <q-card class="cw-card q-pa-lg text-center" v-if="paid && contentUnlocked && !expired">
       <q-card-section>
         <q-icon name="check_circle" size="64px" color="positive" class="q-mb-md"></q-icon>
@@ -199,8 +249,7 @@
         </q-btn>
 
         <q-btn v-if="onionUrl" outline color="deep-purple" :href="onionUrl"
-          size="md" class="full-width" icon="security" no-caps
-        >View via Tor</q-btn>
+          size="md" class="full-width" icon="security" no-caps>View via Tor</q-btn>
 
         <div class="text-caption q-mt-md">
           <div v-if="expiresAt">Access expires: <span class="cw-mono" v-text="expiresAtFormatted"></span></div>
@@ -211,7 +260,6 @@
       </q-card-section>
     </q-card>
 
-    <!-- Expired -->
     <q-card class="cw-card q-pa-lg text-center" v-if="expired">
       <q-card-section>
         <q-icon name="lock_clock" size="64px" color="negative" class="q-mb-md"></q-icon>
@@ -221,7 +269,6 @@
       </q-card-section>
     </q-card>
 
-    <!-- Countdown delay -->
     <q-card class="cw-card q-pa-lg text-center" v-if="paid && !contentUnlocked && !expired">
       <q-card-section>
         <q-icon name="timer" size="64px" style="color: var(--cw-orange);" class="q-mb-md"></q-icon>
@@ -231,8 +278,7 @@
         <div class="text-h2 cw-amount q-mb-lg" v-text="Math.ceil(unlockInSeconds) + 's'"></div>
 
         <q-linear-progress :value="delayProgress" color="orange" size="20px" class="q-mb-md"
-          style="border-radius: 4px;"
-        >
+          style="border-radius: 4px;">
           <div class="absolute-full flex flex-center">
             <q-badge color="transparent" text-color="white"
               v-text="Math.round(delayProgress * 100) + '%'"></q-badge>
@@ -253,7 +299,8 @@
 
 {% block scripts %}
 <script>
-  const itemData = JSON.parse({{ item | tojson | safe }})
+  const itemData = JSON.parse({{ item | tojson | safe }});
+  const EMBED_MODE = {{ 'true' if embed_mode else 'false' }};
 </script>
 <script src="{{ static_url_for('contentwall/static', path='js/display.js') }}"></script>
 {% endblock %}

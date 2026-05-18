@@ -1,5 +1,9 @@
 {% extends "public.html" %}
 
+{% block head %}
+<meta name="robots" content="noindex">
+{% endblock %}
+
 {% block styles %}
 <style>
   :root {
@@ -14,8 +18,7 @@
     box-shadow: var(--cw-glow);
     color: #f5f1e8;
   }
-  .cw-card .text-grey,
-  .cw-card .text-caption { color: #b9aeb6 !important; }
+  .cw-card .text-grey, .cw-card .text-caption { color: #b9aeb6 !important; }
   .cw-title { font-family: monospace; letter-spacing: 0.04em; }
   .article-content {
     background: rgba(255,107,0,0.04);
@@ -26,6 +29,33 @@
     white-space: pre-wrap;
     font-size: 16px;
     color: #f5f1e8;
+  }
+  .article-html {
+    background: rgba(255,107,0,0.04);
+    border-left: 3px solid var(--cw-orange);
+    border-radius: 4px;
+    padding: 24px;
+    line-height: 1.8;
+    font-size: 16px;
+    color: #f5f1e8;
+  }
+  .article-html h1, .article-html h2, .article-html h3 {
+    font-family: monospace;
+    color: var(--cw-orange);
+    margin-top: 1.2em;
+  }
+  .article-html a { color: var(--cw-orange); }
+  .article-html code {
+    background: rgba(0,0,0,0.4);
+    color: #ffb070;
+    padding: 2px 6px;
+    border-radius: 3px;
+  }
+  .article-html pre {
+    background: rgba(0,0,0,0.4);
+    padding: 12px;
+    border-radius: 6px;
+    overflow-x: auto;
   }
   .image-content img {
     max-width: 100%;
@@ -44,6 +74,19 @@
     justify-content: space-between;
     font-family: monospace;
   }
+  .cw-media {
+    width: 100%;
+    border-radius: 8px;
+    border: 1px solid rgba(255,107,0,0.25);
+    background: #000;
+  }
+  .cw-tip-card {
+    background: rgba(255,107,0,0.05);
+    border: 1px dashed rgba(255,107,0,0.4);
+    border-radius: 8px;
+    padding: 16px;
+    margin-top: 16px;
+  }
 </style>
 {% endblock %}
 
@@ -54,7 +97,7 @@
       <q-card-section>
         <div class="row items-center q-mb-md">
           <q-icon name="lock_open" color="positive" size="32px" class="q-mr-md"></q-icon>
-          <div>
+          <div class="col">
             <div class="text-h5 cw-title q-mb-xs">{{ title }}</div>
             <div class="text-caption">// UNLOCKED CONTENT</div>
           </div>
@@ -67,11 +110,29 @@
         {% endif %}
 
         {% if content_type == 'article' %}
-        <div class="article-content">{{ article_content }}</div>
+          {% if use_markdown and article_html %}
+          <div class="article-html">{{ article_html | safe }}</div>
+          {% else %}
+          <div class="article-content">{{ article_content }}</div>
+          {% endif %}
+
         {% elif content_type == 'image' %}
         <div class="image-content text-center">
           <img src="{{ image_data }}" alt="{{ title }}" />
         </div>
+
+        {% elif content_type == 'audio' %}
+        <audio controls preload="metadata" class="cw-media" style="height: 56px;">
+          <source src="{{ media_url }}" type="{{ media_mime }}">
+          Your browser does not support audio playback.
+        </audio>
+
+        {% elif content_type == 'video' %}
+        <video controls preload="metadata" class="cw-media" playsinline>
+          <source src="{{ media_url }}" type="{{ media_mime }}">
+          Your browser does not support video playback.
+        </video>
+
         {% elif content_type == 'bundle' %}
         <div>
           <div class="text-subtitle2 q-mb-md">
@@ -94,6 +155,28 @@
         </div>
         {% endif %}
 
+        {% if allow_tips %}
+        <div class="cw-tip-card" id="cw-tip-card">
+          <div class="text-subtitle2 q-mb-sm">
+            <q-icon name="favorite" style="color: var(--cw-red);" class="q-mr-xs"></q-icon>
+            Enjoyed it? Tip the creator
+          </div>
+          <div class="row q-gutter-sm items-center">
+            <input id="cw-tip-amount" type="number" min="1" value="500"
+              style="width: 120px; padding: 6px 10px; background: rgba(0,0,0,0.3);
+                     border: 1px solid rgba(255,107,0,0.3); border-radius: 4px;
+                     color: #f5f1e8; font-family: monospace;" />
+            <span class="text-caption">sats</span>
+            <q-btn outline color="orange" no-caps onclick="cwTip()">
+              <q-icon name="bolt" class="q-mr-xs"></q-icon> Send tip
+            </q-btn>
+          </div>
+          <div id="cw-tip-status" class="text-caption q-mt-sm"></div>
+          <div id="cw-tip-qr" style="display: none; max-width: 240px; margin: 12px auto;
+                                      padding: 8px; background: #fff; border-radius: 8px;"></div>
+        </div>
+        {% endif %}
+
         <q-separator dark class="q-my-lg" style="background: rgba(255,107,0,0.3);"></q-separator>
 
         <div class="row items-center justify-between">
@@ -108,4 +191,68 @@
     </q-card>
   </div>
 </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const ITEM_ID      = "{{ item_id }}";
+const PAYMENT_HASH = "{{ payment_hash }}";
+
+async function cwTip() {
+  const amountEl = document.getElementById('cw-tip-amount');
+  const statusEl = document.getElementById('cw-tip-status');
+  const qrEl     = document.getElementById('cw-tip-qr');
+  const amount = parseInt(amountEl.value, 10);
+  if (!amount || amount < 1) {
+    statusEl.textContent = 'Enter a positive amount';
+    return;
+  }
+  statusEl.textContent = 'Creating tip invoice...';
+  try {
+    const r = await fetch(`/contentwall/api/v1/items/${ITEM_ID}/tip`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({amount, paywall_payment_hash: PAYMENT_HASH}),
+    });
+    if (!r.ok) { statusEl.textContent = 'Tip invoice failed'; return; }
+    const data = await r.json();
+    statusEl.innerHTML = '<span style="color:#ff6b00;">Scan or copy:</span> ' +
+      `<code style="font-size:11px;word-break:break-all;">${data.payment_request.slice(0,30)}…</code>`;
+    qrEl.style.display = 'block';
+    qrEl.innerHTML = '';
+    // Lazy load QRCode lib
+    if (!window.QRCode) {
+      await new Promise((res, rej) => {
+        const s = document.createElement('script');
+        s.src = 'https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js';
+        s.onload = res; s.onerror = rej;
+        document.head.appendChild(s);
+      });
+    }
+    const canvas = document.createElement('canvas');
+    qrEl.appendChild(canvas);
+    window.QRCode.toCanvas(canvas, data.payment_request, {width: 220, margin: 1}, () => {});
+    // Poll
+    const poll = setInterval(async () => {
+      try {
+        const c = await fetch(`/contentwall/api/v1/items/${ITEM_ID}/tip/check`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({payment_hash: data.payment_hash}),
+        });
+        if (!c.ok) return;
+        const cd = await c.json();
+        if (cd.paid) {
+          clearInterval(poll);
+          statusEl.innerHTML = `<span style="color:#22c55e;">⚡ Tip of ${cd.amount_sats} sats received — thank you!</span>`;
+          qrEl.style.display = 'none';
+        }
+      } catch (_) {}
+    }, 3000);
+    setTimeout(() => clearInterval(poll), 300000);
+  } catch (err) {
+    statusEl.textContent = 'Error: ' + err.message;
+  }
+}
+</script>
 {% endblock %}

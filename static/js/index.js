@@ -11,6 +11,7 @@ const blankFormData = () => ({
   content_type: 'article',
   article_content: '',
   image_file: null,
+  media_file: null,
   bundle_files: [],
   amount: 100,
   currency: 'sat',
@@ -24,6 +25,8 @@ const blankFormData = () => ({
   access_duration_seconds: 0,
   webhook_url: '',
   max_views: 0,
+  markdown: false,
+  allow_tips: true,
 });
 
 window.app = Vue.createApp({
@@ -45,6 +48,12 @@ window.app = Vue.createApp({
       itemDialog: { show: false, loading: false, data: blankFormData() },
       deleteDialog: { show: false, loading: false, item: {} },
       statsDialog: { show: false, title: '', data: { payment_count: 0, total_sats: 0, unique_payers: 0 } },
+      couponDialog: {
+        show: false, title: '', itemId: null, coupons: [], creating: false,
+        draft: { code: '', discount_percent: 0, discount_fixed_sats: 0, uses_remaining: -1, expires_at: '' },
+      },
+      embedDialog: { show: false, title: '', snippet: '' },
+      tipsTotal: 0,
     };
   },
 
@@ -56,6 +65,7 @@ window.app = Vue.createApp({
         if (d.content_type === 'article' && !d.article_content) return false;
         if (d.content_type === 'image' && !d.image_file) return false;
         if (d.content_type === 'bundle' && (!d.bundle_files || !d.bundle_files.length)) return false;
+        if ((d.content_type === 'audio' || d.content_type === 'video') && !d.media_file) return false;
       }
       return true;
     },
@@ -75,6 +85,18 @@ window.app = Vue.createApp({
     async loadAll() {
       await this.loadItems();
       await this.loadTimeseries();
+      await this.loadTipsTotal();
+    },
+
+    async loadTipsTotal() {
+      try {
+        const r = await LNbits.api.request(
+          'GET',
+          '/contentwall/api/v1/stats/tips_total',
+          g.user.wallets[0].inkey,
+        );
+        this.tipsTotal = (r.data && r.data.total_sats) || 0;
+      } catch (_) { /* optional */ }
     },
 
     async loadItems() {
@@ -139,7 +161,10 @@ window.app = Vue.createApp({
     },
 
     contentTypeColor(t) {
-      return { article: 'blue', image: 'purple', bundle: 'teal' }[t] || 'grey';
+      return {
+        article: 'blue', image: 'purple', bundle: 'teal',
+        audio: 'pink', video: 'red',
+      }[t] || 'grey';
     },
 
     formatDuration(s) {
@@ -175,8 +200,14 @@ window.app = Vue.createApp({
           access_duration_seconds: item.access_duration_seconds || 0,
           webhook_url: item.webhook_url || '',
           max_views: item.max_views || 0,
+          markdown: !!item.markdown,
+          allow_tips: item.allow_tips === undefined ? true : !!item.allow_tips,
         },
       };
+    },
+
+    onMediaSelected(file) {
+      this.itemDialog.data.media_file = file;
     },
 
     onImageSelected(file) {
@@ -210,6 +241,8 @@ window.app = Vue.createApp({
             access_duration_seconds: parseInt(d.access_duration_seconds) || 0,
             webhook_url: d.webhook_url || null,
             max_views: parseInt(d.max_views) || 0,
+            markdown: d.markdown,
+            allow_tips: d.allow_tips,
           };
           await LNbits.api.request(
             'PATCH',
@@ -241,6 +274,8 @@ window.app = Vue.createApp({
           access_duration_seconds: parseInt(d.access_duration_seconds) || 0,
           webhook_url: d.webhook_url || null,
           max_views: parseInt(d.max_views) || 0,
+          markdown: d.markdown,
+          allow_tips: d.allow_tips,
         };
 
         const resp = await LNbits.api.request(
@@ -267,7 +302,22 @@ window.app = Vue.createApp({
           }
         }
 
-        // Bundle uploads (one POST per file)
+        // Audio / video upload
+        if ((d.content_type === 'audio' || d.content_type === 'video') && d.media_file) {
+          const fd = new FormData();
+          fd.append('upload_file', d.media_file);
+          const r = await fetch(`/contentwall/api/v1/items/${itemId}/upload-media`, {
+            method: 'POST',
+            headers: { 'X-Api-Key': wallet.adminkey },
+            body: fd,
+          });
+          if (!r.ok) {
+            const err = await r.json();
+            throw new Error(err.detail || 'Media upload failed');
+          }
+        }
+
+        // Bundle uploads
         if (d.content_type === 'bundle' && d.bundle_files && d.bundle_files.length) {
           for (const file of d.bundle_files) {
             const fd = new FormData();
@@ -370,6 +420,118 @@ window.app = Vue.createApp({
         const a = document.createElement('a');
         a.href = url;
         a.download = 'contentwall-export.csv';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      } catch (err) {
+        this.$q.notify({ type: 'negative', message: err.message });
+      }
+    },
+
+    // ---- v1.2.0 ----
+
+    async openCoupons(item) {
+      this.couponDialog = {
+        show: true, title: item.title, itemId: item.id, coupons: [], creating: false,
+        draft: { code: '', discount_percent: 0, discount_fixed_sats: 0, uses_remaining: -1, expires_at: '' },
+      };
+      await this.refreshCoupons();
+    },
+
+    async refreshCoupons() {
+      try {
+        const r = await LNbits.api.request(
+          'GET',
+          `/contentwall/api/v1/items/${this.couponDialog.itemId}/coupons`,
+          g.user.wallets[0].adminkey,
+        );
+        this.couponDialog.coupons = r.data || [];
+      } catch (err) {
+        LNbits.utils.notifyApiError(err);
+      }
+    },
+
+    async createCoupon() {
+      const d = this.couponDialog.draft;
+      if (!d.code || (d.discount_percent === 0 && d.discount_fixed_sats === 0)) {
+        this.$q.notify({ type: 'warning', message: 'Set a code AND at least one discount type' });
+        return;
+      }
+      this.couponDialog.creating = true;
+      try {
+        await LNbits.api.request(
+          'POST',
+          `/contentwall/api/v1/items/${this.couponDialog.itemId}/coupons`,
+          g.user.wallets[0].adminkey,
+          {
+            code: d.code.toUpperCase(),
+            discount_percent: parseInt(d.discount_percent) || 0,
+            discount_fixed_sats: parseInt(d.discount_fixed_sats) || 0,
+            uses_remaining: parseInt(d.uses_remaining),
+            expires_at: d.expires_at || null,
+          },
+        );
+        this.couponDialog.draft = {
+          code: '', discount_percent: 0, discount_fixed_sats: 0, uses_remaining: -1, expires_at: '',
+        };
+        await this.refreshCoupons();
+      } catch (err) {
+        LNbits.utils.notifyApiError(err);
+      } finally {
+        this.couponDialog.creating = false;
+      }
+    },
+
+    async deleteCoupon(coupon) {
+      try {
+        await LNbits.api.request(
+          'DELETE',
+          `/contentwall/api/v1/items/${this.couponDialog.itemId}/coupons/${coupon.id}`,
+          g.user.wallets[0].adminkey,
+        );
+        await this.refreshCoupons();
+      } catch (err) {
+        LNbits.utils.notifyApiError(err);
+      }
+    },
+
+    async openEmbed(item) {
+      try {
+        const r = await LNbits.api.request(
+          'GET',
+          `/contentwall/api/v1/items/${item.id}/embed-snippet`,
+          g.user.wallets[0].inkey,
+        );
+        this.embedDialog = {
+          show: true,
+          title: item.title,
+          snippet: (r.data && r.data.snippet) || '',
+        };
+      } catch (err) {
+        LNbits.utils.notifyApiError(err);
+      }
+    },
+
+    copyEmbedSnippet() {
+      navigator.clipboard.writeText(this.embedDialog.snippet).then(() => {
+        this.$q.notify({ type: 'positive', message: 'Snippet copied' });
+      });
+    },
+
+    async downloadBackup() {
+      try {
+        const wallet = g.user.wallets[0];
+        const r = await fetch('/contentwall/api/v1/backup', {
+          headers: { 'X-Api-Key': wallet.adminkey },
+        });
+        if (!r.ok) throw new Error('Backup failed');
+        const data = await r.json();
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `contentwall-backup-${new Date().toISOString().slice(0, 10)}.json`;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);

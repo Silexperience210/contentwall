@@ -1,0 +1,153 @@
+{% extends "public.html" %}
+
+{% block styles %}
+<style>
+  :root {
+    --cw-orange: #ff6b00;
+    --cw-red:    #ff2a45;
+    --cw-glow:   0 0 24px rgba(255, 107, 0, 0.35);
+  }
+  body { background: radial-gradient(ellipse at top, #1a1320 0%, #0a0814 70%); }
+  .cw-card {
+    background: linear-gradient(160deg, rgba(40,20,30,0.85), rgba(15,10,20,0.95));
+    border: 1px solid rgba(255, 107, 0, 0.25);
+    box-shadow: var(--cw-glow);
+    color: #f5f1e8;
+  }
+  .cw-card .text-grey, .cw-card .text-caption { color: #b9aeb6 !important; }
+  .cw-title { font-family: monospace; letter-spacing: 0.04em; }
+  .cw-amount { font-family: monospace; color: var(--cw-orange); }
+  .cw-row {
+    border: 1px solid rgba(255, 107, 0, 0.18);
+    border-radius: 8px;
+    padding: 14px;
+    margin-bottom: 10px;
+    background: rgba(255, 107, 0, 0.03);
+  }
+</style>
+{% endblock %}
+
+{% block page %}
+<div class="row q-col-gutter-md justify-center q-pa-md">
+  <div class="col-12 col-md-8">
+    <q-card class="cw-card q-pa-lg">
+      <q-card-section>
+        <div class="text-h5 cw-title q-mb-md">// MY PURCHASES</div>
+        <p class="text-caption">
+          ContentWall stores nothing about you on the server. This list comes
+          from your browser's local storage and shows every content item
+          you've unlocked from this device.
+        </p>
+
+        <q-separator dark class="q-my-md" style="background: rgba(255,107,0,0.3);"></q-separator>
+
+        <div v-if="loading" class="text-center q-pa-md">
+          <q-spinner-dots color="orange" size="2em"></q-spinner-dots>
+        </div>
+
+        <div v-else-if="!purchases.length" class="text-center q-pa-md">
+          <q-icon name="shopping_cart" size="48px" style="color: var(--cw-orange);"></q-icon>
+          <p class="q-mt-md">No purchases recorded on this device yet.</p>
+        </div>
+
+        <div v-else>
+          <div v-for="p in purchases" :key="p.payment_hash" class="cw-row">
+            <div class="row items-center">
+              <div class="col">
+                <strong v-text="p.title"></strong>
+                <span v-if="p.archived" class="text-caption" style="color: #b9aeb6;"> (archived by creator)</span>
+                <br>
+                <span class="text-caption" v-text="p.description"></span>
+                <div class="text-caption q-mt-xs">
+                  Paid <span class="cw-amount" v-text="p.amount_paid + ' sat'"></span>
+                  <span v-if="p.expires_at"> · expires <span v-text="formatDate(p.expires_at)"></span></span>
+                  <span v-if="p.max_views > 0"> · <span v-text="(p.max_views - p.views_count) + '/' + p.max_views"></span> views left</span>
+                </div>
+              </div>
+              <div class="col-auto">
+                <q-btn outline color="orange" size="sm" no-caps icon="visibility"
+                  :href="contentUrl(p)" target="_blank">Open</q-btn>
+                <q-btn flat color="negative" size="sm" no-caps icon="delete"
+                  @click="removeLocal(p.payment_hash)">Forget</q-btn>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <q-separator dark class="q-my-md" style="background: rgba(255,107,0,0.3);"></q-separator>
+        <div class="text-caption text-center">
+          Lost a purchase? Paste the payment hash here to add it back:
+        </div>
+        <div class="row q-mt-sm q-gutter-sm justify-center">
+          <q-input filled dark dense v-model="newHash" placeholder="payment_hash"
+            style="min-width: 260px;"></q-input>
+          <q-input filled dark dense v-model="newItemId" placeholder="item_id"
+            style="min-width: 200px;"></q-input>
+          <q-btn outline color="orange" no-caps @click="addByHash">Add</q-btn>
+        </div>
+      </q-card-section>
+    </q-card>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+window.app = Vue.createApp({
+  data() {
+    return { purchases: [], loading: true, newHash: '', newItemId: '' };
+  },
+  async mounted() { await this.refresh(); },
+  methods: {
+    storageKey() { return 'contentwall.purchases'; },
+    readLocal() {
+      try { return JSON.parse(localStorage.getItem(this.storageKey()) || '[]'); }
+      catch (_) { return []; }
+    },
+    writeLocal(arr) {
+      localStorage.setItem(this.storageKey(), JSON.stringify(arr));
+    },
+    async refresh() {
+      this.loading = true;
+      const local = this.readLocal();
+      const hashes = local.map(p => p.payment_hash);
+      try {
+        const r = await fetch('/contentwall/api/v1/me/purchases', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ hashes }),
+        });
+        this.purchases = r.ok ? await r.json() : [];
+      } catch (_) {
+        this.purchases = [];
+      } finally {
+        this.loading = false;
+      }
+    },
+    contentUrl(p) {
+      const t = p.token ? `&t=${p.token}` : '';
+      return `/contentwall/content/${p.item_id}?payment_hash=${p.payment_hash}${t}`;
+    },
+    formatDate(d) {
+      if (!d) return '';
+      try { return new Date(d).toLocaleString(); } catch (_) { return d; }
+    },
+    removeLocal(hash) {
+      const arr = this.readLocal().filter(p => p.payment_hash !== hash);
+      this.writeLocal(arr);
+      this.purchases = this.purchases.filter(p => p.payment_hash !== hash);
+    },
+    async addByHash() {
+      if (!this.newHash || !this.newItemId) return;
+      const arr = this.readLocal();
+      if (!arr.find(p => p.payment_hash === this.newHash)) {
+        arr.push({ payment_hash: this.newHash, item_id: this.newItemId });
+        this.writeLocal(arr);
+      }
+      this.newHash = ''; this.newItemId = '';
+      await this.refresh();
+    },
+  },
+});
+</script>
+{% endblock %}

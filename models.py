@@ -34,6 +34,10 @@ class Item(BaseModel):
     webhook_url: Optional[str] = None
     max_views: int = 0  # 0 = unlimited views per payment
 
+    # v1.2.0 fields
+    markdown: int = 0       # render article body as markdown
+    allow_tips: int = 1     # show "tip the creator" form after unlock
+
 
 class ItemFile(BaseModel):
     id: str
@@ -49,7 +53,7 @@ class ItemFile(BaseModel):
 class CreateItem(BaseModel):
     title: str = Field(..., min_length=1, max_length=200)
     description: str = Field(default="", max_length=2000)
-    content_type: str = Field(..., pattern="^(article|image|bundle)$")
+    content_type: str = Field(..., pattern="^(article|image|bundle|audio|video)$")
     article_content: Optional[str] = Field(default=None, max_length=200000)
     amount: int = Field(..., ge=1)
     currency: str = Field(default="sat")
@@ -65,6 +69,10 @@ class CreateItem(BaseModel):
     access_duration_seconds: int = Field(default=0, ge=0)
     webhook_url: Optional[str] = Field(default=None, max_length=500)
     max_views: int = Field(default=0, ge=0)
+
+    # v1.2.0 fields
+    markdown: bool = Field(default=False)
+    allow_tips: bool = Field(default=True)
 
 
 class UpdateItem(BaseModel):
@@ -82,7 +90,9 @@ class UpdateItem(BaseModel):
     access_duration_seconds: Optional[int] = Field(default=None, ge=0)
     webhook_url: Optional[str] = Field(default=None, max_length=500)
     max_views: Optional[int] = Field(default=None, ge=0)
-    archived: Optional[bool] = None  # toggle soft delete
+    archived: Optional[bool] = None
+    markdown: Optional[bool] = None
+    allow_tips: Optional[bool] = None
 
 
 class Payment(BaseModel):
@@ -98,6 +108,12 @@ class Payment(BaseModel):
 
 class CreateInvoiceData(BaseModel):
     amount: Optional[int] = None
+    coupon_code: Optional[str] = Field(default=None, max_length=64)
+
+
+class CreateTipData(BaseModel):
+    amount: int = Field(..., ge=1)
+    paywall_payment_hash: Optional[str] = None  # to link the tip to a purchase
 
 
 class CheckPaymentData(BaseModel):
@@ -120,6 +136,38 @@ class PublicItem(BaseModel):
     access_duration_seconds: int = 0
     max_views: int = 0
     file_count: int = 0
+    markdown: bool = False
+    allow_tips: bool = True
+
+
+class Coupon(BaseModel):
+    id: str
+    item_id: str
+    code: str
+    discount_percent: int = 0
+    discount_fixed_sats: int = 0
+    uses_remaining: int = -1  # -1 = unlimited
+    uses_count: int = 0
+    expires_at: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+class CreateCoupon(BaseModel):
+    code: str = Field(..., min_length=2, max_length=64)
+    discount_percent: int = Field(default=0, ge=0, le=100)
+    discount_fixed_sats: int = Field(default=0, ge=0)
+    uses_remaining: int = Field(default=-1, ge=-1)
+    expires_at: Optional[str] = None
+
+
+class Tip(BaseModel):
+    id: str
+    item_id: str
+    paywall_payment_hash: Optional[str] = None
+    tip_payment_hash: str
+    amount_sats: int
+    paid_at: Optional[str] = None
+    created_at: Optional[str] = None
 
 
 class ItemStats(BaseModel):

@@ -544,3 +544,246 @@ def verify_access_token(
         return False
     expected = make_access_token(signing_key, item_id, payment_hash)
     return hmac.compare_digest(expected, token)
+
+
+# ---------------------------------------------------------------------------
+# Audio / Video file storage (single-file, like image but bigger)
+# ---------------------------------------------------------------------------
+
+
+async def store_media_file(item_id: str, upload_file) -> dict:
+    """Store an audio/video file using the same flat-file scheme as images."""
+    _ensure_files_dir()
+    file_ext = os.path.splitext(upload_file.filename or "")[1].lower()
+    # Tolerate a broad set; the content_type is what we serve back.
+    if file_ext not in (".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav",
+                        ".mp4", ".webm", ".mkv", ".mov"):
+        file_ext = ".bin"
+    file_path = os.path.join(FILES_DIR, f"{item_id}{file_ext}")
+
+    content = await upload_file.read()
+    content_hash = _hash_content(content)
+    with open(file_path, "wb") as f:
+        f.write(content)
+
+    await db.execute(
+        "UPDATE contentwall.items SET content_hash = :hash WHERE id = :id",
+        {"hash": content_hash, "id": item_id},
+    )
+    return {
+        "file_path": file_path,
+        "content_hash": content_hash,
+        "size": len(content),
+        "content_type": upload_file.content_type or "application/octet-stream",
+    }
+
+
+async def get_media_file_info(item_id: str) -> Optional[dict]:
+    """Return path + content_type for an audio/video item, if found on disk."""
+    candidates = [
+        (".mp3", "audio/mpeg"), (".m4a", "audio/mp4"),
+        (".aac", "audio/aac"), (".ogg", "audio/ogg"),
+        (".opus", "audio/ogg"), (".wav", "audio/wav"),
+        (".mp4", "video/mp4"), (".webm", "video/webm"),
+        (".mkv", "video/x-matroska"), (".mov", "video/quicktime"),
+    ]
+    for ext, ct in candidates:
+        fp = os.path.join(FILES_DIR, f"{item_id}{ext}")
+        if os.path.exists(fp):
+            return {"file_path": fp, "content_type": ct, "size": os.path.getsize(fp)}
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Coupons
+# ---------------------------------------------------------------------------
+
+
+from .models import Coupon, CreateCoupon, Tip  # noqa: E402  (kept after schema)
+
+
+async def create_coupon(item_id: str, data: CreateCoupon) -> Coupon:
+    coupon = Coupon(
+        id=urlsafe_short_hash(),
+        item_id=item_id,
+        code=data.code.upper(),
+        discount_percent=data.discount_percent,
+        discount_fixed_sats=data.discount_fixed_sats,
+        uses_remaining=data.uses_remaining,
+        uses_count=0,
+        expires_at=data.expires_at,
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+    await db.insert("contentwall.coupons", coupon)
+    return coupon
+
+
+async def get_coupon(item_id: str, code: str) -> Optional[Coupon]:
+    return await db.fetchone(
+        """
+        SELECT * FROM contentwall.coupons
+        WHERE item_id = :id AND UPPER(code) = :code
+        """,
+        {"id": item_id, "code": code.upper()},
+        Coupon,
+    )
+
+
+async def list_coupons(item_id: str) -> list[Coupon]:
+    return await db.fetchall(
+        "SELECT * FROM contentwall.coupons WHERE item_id = :id ORDER BY created_at DESC",
+        {"id": item_id},
+        model=Coupon,
+    )
+
+
+async def delete_coupon(coupon_id: str) -> None:
+    await db.execute(
+        "DELETE FROM contentwall.coupons WHERE id = :id", {"id": coupon_id}
+    )
+
+
+async def consume_coupon(coupon: Coupon) -> bool:
+    """
+    Atomic-ish consumption: decrement uses_remaining if non-unlimited,
+    bump uses_count. Returns True if successful, False if exhausted/expired.
+    """
+    # Expiry check
+    if coupon.expires_at:
+        exp = datetime.fromisoformat(coupon.expires_at.replace("Z", "+00:00"))
+        if datetime.now(timezone.utc) > exp:
+            return False
+    # Uses check
+    if coupon.uses_remaining == 0:
+        return False
+    new_remaining = (
+        coupon.uses_remaining - 1 if coupon.uses_remaining > 0 else -1
+    )
+    await db.execute(
+        """
+        UPDATE contentwall.coupons
+        SET uses_count = COALESCE(uses_count, 0) + 1,
+            uses_remaining = :remaining
+        WHERE id = :id
+        """,
+        {"remaining": new_remaining, "id": coupon.id},
+    )
+    return True
+
+
+def apply_coupon_to_amount(amount: int, coupon: Coupon) -> int:
+    """
+    Return the discounted amount. Percent and fixed are summed:
+    e.g. 30% off + 10 sat off on 100 sat = 60 sat.
+    Floor at 1 sat (never zero — paywalls require an invoice).
+    """
+    out = amount
+    if coupon.discount_percent and coupon.discount_percent > 0:
+        out = out - (out * coupon.discount_percent // 100)
+    if coupon.discount_fixed_sats and coupon.discount_fixed_sats > 0:
+        out = out - coupon.discount_fixed_sats
+    return max(1, out)
+
+
+# ---------------------------------------------------------------------------
+# Tips
+# ---------------------------------------------------------------------------
+
+
+async def record_tip(
+    item_id: str,
+    tip_payment_hash: str,
+    amount_sats: int,
+    paywall_payment_hash: Optional[str] = None,
+) -> Tip:
+    tip = Tip(
+        id=urlsafe_short_hash(),
+        item_id=item_id,
+        paywall_payment_hash=paywall_payment_hash,
+        tip_payment_hash=tip_payment_hash,
+        amount_sats=amount_sats,
+        paid_at=datetime.now(timezone.utc).isoformat(),
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+    await db.insert("contentwall.tips", tip)
+    return tip
+
+
+async def list_tips_for_item(item_id: str) -> list[Tip]:
+    return await db.fetchall(
+        "SELECT * FROM contentwall.tips WHERE item_id = :id ORDER BY paid_at DESC",
+        {"id": item_id},
+        model=Tip,
+    )
+
+
+async def get_tips_total(wallet_ids: list[str]) -> int:
+    """Sum of all tips across a user's items, for the dashboard."""
+    if not wallet_ids:
+        return 0
+    q = ",".join([f"'{w}'" for w in wallet_ids])
+    row = await db.fetchone(
+        f"""
+        SELECT COALESCE(SUM(t.amount_sats), 0) AS total
+        FROM contentwall.tips t
+        JOIN contentwall.items i ON i.id = t.item_id
+        WHERE i.wallet IN ({q})
+        """
+    )
+    if not row:
+        return 0
+    return int(row["total"] or 0)
+
+
+# ---------------------------------------------------------------------------
+# "My purchases" lookup (anonymous)
+# ---------------------------------------------------------------------------
+
+
+async def get_purchases_by_hashes(payment_hashes: list[str]) -> list[dict]:
+    """
+    Given a list of payment_hashes (which the client tracks in localStorage),
+    return the matching items + token + expiry. We don't expose anything that
+    isn't already tied to a successful payment, so this remains safe to expose
+    without auth.
+    """
+    if not payment_hashes:
+        return []
+    # SQLite doesn't support tuple binding well; do it ourselves but safely.
+    safe = [h for h in payment_hashes if all(c in "0123456789abcdefABCDEF" for c in h)]
+    if not safe:
+        return []
+    placeholders = ",".join(f"'{h}'" for h in safe)
+    rows = await db.fetchall(
+        f"""
+        SELECT
+            p.item_id, p.payment_hash, p.amount_paid, p.paid_at,
+            p.expires_at, p.views_count,
+            i.title, i.description, i.content_type,
+            i.access_signing_key, i.max_views, i.archived_at
+        FROM contentwall.payments p
+        JOIN contentwall.items i ON i.id = p.item_id
+        WHERE p.payment_hash IN ({placeholders})
+        ORDER BY p.paid_at DESC
+        """
+    )
+    out = []
+    for r in rows:
+        token = make_access_token(
+            r["access_signing_key"] or "", r["item_id"], r["payment_hash"]
+        )
+        out.append({
+            "item_id": r["item_id"],
+            "title": r["title"],
+            "description": r["description"],
+            "content_type": r["content_type"],
+            "payment_hash": r["payment_hash"],
+            "amount_paid": int(r["amount_paid"] or 0),
+            "paid_at": r["paid_at"],
+            "expires_at": r["expires_at"],
+            "views_count": int(r["views_count"] or 0),
+            "max_views": int(r["max_views"] or 0),
+            "archived": r["archived_at"] is not None,
+            "token": token,
+        })
+    return out

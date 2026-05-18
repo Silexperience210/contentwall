@@ -33,11 +33,17 @@ from loguru import logger
 
 from .crud import (
     add_bundle_file,
+    apply_coupon_to_amount,
     archive_item,
+    consume_coupon,
+    create_coupon,
     create_item,
+    db,
     delete_bundle_file,
+    delete_coupon,
     delete_item,
     get_article_content,
+    get_coupon,
     get_image_base64,
     get_image_file_info,
     get_item,
@@ -45,17 +51,23 @@ from .crud import (
     get_item_files,
     get_item_stats,
     get_items,
+    get_media_file_info,
     get_payment,
     get_payment_amount,
     get_payment_timestamp,
     get_payments_by_day,
+    get_purchases_by_hashes,
     get_stats_for_wallets,
+    get_tips_total,
     has_paid,
     increment_view_count,
     is_payment_expired,
+    list_coupons,
     list_payments_for_item,
+    list_tips_for_item,
     make_access_token,
     record_payment,
+    record_tip,
     store_article_content,
     store_image_file,
     update_item,
@@ -63,17 +75,24 @@ from .crud import (
 )
 from .helpers import (
     article_teaser,
+    build_share_meta,
     encode_lnurl,
     fire_and_forget_webhook,
+    iter_file_range,
     make_blurred_preview,
     metadata_for_lnurl,
     metadata_hash,
+    parse_range_header,
+    rate_limit_check,
+    render_markdown_safe,
     watermark_image_bytes,
 )
 from .models import (
     CheckPaymentData,
+    CreateCoupon,
     CreateInvoiceData,
     CreateItem,
+    CreateTipData,
     Item,
     PublicItem,
     UpdateItem,
@@ -226,6 +245,43 @@ async def api_upload_image(
     }
 
 
+@contentwall_api_router.post("/api/v1/items/{item_id}/upload-media")
+async def api_upload_media(
+    item_id: str,
+    upload_file: UploadFile = File(...),
+    wallet: WalletTypeInfo = Depends(require_admin_key),
+):
+    """Upload an audio or video file for items of type 'audio' or 'video'."""
+    from .crud import store_media_file
+
+    item = await get_item(item_id)
+    if not item:
+        raise HTTPException(HTTPStatus.NOT_FOUND, "Item not found")
+    if item.wallet != wallet.wallet.id:
+        raise HTTPException(HTTPStatus.FORBIDDEN, "Not your item")
+    if item.content_type not in ("audio", "video"):
+        raise HTTPException(
+            HTTPStatus.BAD_REQUEST, "Item is not an audio or video type"
+        )
+
+    ct = (upload_file.content_type or "").lower()
+    if item.content_type == "audio" and not ct.startswith("audio/"):
+        raise HTTPException(
+            HTTPStatus.BAD_REQUEST, "Expected an audio/* MIME type"
+        )
+    if item.content_type == "video" and not ct.startswith("video/"):
+        raise HTTPException(
+            HTTPStatus.BAD_REQUEST, "Expected a video/* MIME type"
+        )
+
+    result = await store_media_file(item_id, upload_file)
+    return {
+        "success": True,
+        "size": result["size"],
+        "content_type": result["content_type"],
+    }
+
+
 # ---- Bundle multi-file -----------------------------------------------------
 
 
@@ -363,7 +419,18 @@ async def api_export_csv(
 
 
 @contentwall_api_router.post("/api/v1/items/invoice/{item_id}")
-async def api_create_invoice(item_id: str, data: CreateInvoiceData):
+async def api_create_invoice(
+    request: Request, item_id: str, data: CreateInvoiceData
+):
+    # Rate limit: max 10 invoice creations per minute per IP per item
+    client_ip = request.client.host if request.client else "unknown"
+    rate_key = f"invoice:{client_ip}:{item_id}"
+    if not rate_limit_check(rate_key, max_requests=10, window_seconds=60):
+        raise HTTPException(
+            HTTPStatus.TOO_MANY_REQUESTS,
+            "Too many invoice requests. Please wait a minute.",
+        )
+
     item = await get_item(item_id)
     if not item:
         raise HTTPException(HTTPStatus.NOT_FOUND, "Item not found")
@@ -382,23 +449,46 @@ async def api_create_invoice(item_id: str, data: CreateInvoiceData):
                 "This content is not yet available for purchase",
             )
 
-    amount = data.amount if data and data.amount else item.amount
-    if amount < item.amount:
-        raise HTTPException(
-            HTTPStatus.BAD_REQUEST,
-            f"Minimum amount is {item.amount} {item.currency}",
-        )
+    requested_amount = data.amount if data and data.amount else item.amount
+
+    # Coupon
+    applied_coupon = None
+    if data and data.coupon_code:
+        coupon = await get_coupon(item_id, data.coupon_code)
+        if not coupon:
+            raise HTTPException(HTTPStatus.BAD_REQUEST, "Invalid coupon code")
+        if not await consume_coupon(coupon):
+            raise HTTPException(
+                HTTPStatus.GONE, "Coupon is exhausted or expired"
+            )
+        applied_coupon = coupon
+        # Discount applies to the floor price, not to a custom tip amount.
+        effective_min = apply_coupon_to_amount(item.amount, coupon)
+        if requested_amount < effective_min:
+            requested_amount = effective_min
+    else:
+        if requested_amount < item.amount:
+            raise HTTPException(
+                HTTPStatus.BAD_REQUEST,
+                f"Minimum amount is {item.amount} {item.currency}",
+            )
+
+    extra = {"tag": "contentwall", "id": item_id}
+    if applied_coupon:
+        extra["coupon_code"] = applied_coupon.code
 
     try:
         payment = await create_invoice(
             wallet_id=item.wallet,
-            amount=amount,
+            amount=requested_amount,
             memo=item.memo,
-            extra={"tag": "contentwall", "id": item_id},
+            extra=extra,
         )
         return {
             "payment_hash": payment.payment_hash,
             "payment_request": payment.bolt11,
+            "amount": requested_amount,
+            "coupon_applied": applied_coupon.code if applied_coupon else None,
         }
     except Exception as exc:
         logger.error(f"Error creating invoice for item {item_id}: {exc}")
@@ -531,6 +621,16 @@ async def api_get_preview(item_id: str):
             ],
         }
 
+    if item.content_type in ("audio", "video"):
+        info = await get_media_file_info(item_id)
+        return {
+            "content_type": item.content_type,
+            "teaser_text": item.teaser_text,
+            "media_present": info is not None,
+            "media_size": info["size"] if info else 0,
+            "media_mime": info["content_type"] if info else None,
+        }
+
     return {"content_type": item.content_type}
 
 
@@ -585,10 +685,15 @@ async def api_get_content(
         "content_type": item.content_type,
         "title": item.title,
         "description": item.description,
+        "markdown": bool(item.markdown),
+        "allow_tips": bool(item.allow_tips),
     }
 
     if item.content_type == "article":
-        response["article_content"] = await get_article_content(item_id)
+        raw = await get_article_content(item_id)
+        response["article_content"] = raw
+        if item.markdown and raw:
+            response["article_html"] = render_markdown_safe(raw)
     elif item.content_type == "image":
         img = await get_image_base64(item_id)
         if img:
@@ -606,6 +711,11 @@ async def api_get_content(
             }
             for f in files
         ]
+    elif item.content_type in ("audio", "video"):
+        # Media is delivered via /api/v1/items/media/<id> (Range-aware)
+        info = await get_media_file_info(item_id)
+        response["media_mime"] = info["content_type"] if info else None
+        response["media_size"] = info["size"] if info else 0
 
     return response
 
@@ -958,3 +1068,359 @@ async def _verify_access(
     except Exception as exc:
         logger.error(f"Error in _verify_access: {exc}")
     return False
+
+
+# ===========================================================================
+# v1.2.0 endpoints
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# Audio / video streaming with HTTP Range support
+# ---------------------------------------------------------------------------
+
+
+@contentwall_api_router.get("/api/v1/items/media/{item_id}")
+@contentwall_api_router.head("/api/v1/items/media/{item_id}")
+async def api_get_media(
+    request: Request,
+    item_id: str,
+    payment_hash: str,
+    t: str = Query(""),
+):
+    """
+    Range-aware streaming endpoint for audio/video.
+    Returns 206 Partial Content when a Range header is present,
+    otherwise the full file as 200.
+    """
+    item = await get_item(item_id)
+    if not item:
+        raise HTTPException(HTTPStatus.NOT_FOUND, "Item not found")
+    if item.content_type not in ("audio", "video"):
+        raise HTTPException(HTTPStatus.BAD_REQUEST, "Item is not media")
+
+    if not await _verify_access(item, item_id, payment_hash, t):
+        raise HTTPException(HTTPStatus.FORBIDDEN, "Payment required")
+    if await is_payment_expired(item_id, payment_hash):
+        raise HTTPException(HTTPStatus.GONE, "Access has expired")
+
+    info = await get_media_file_info(item_id)
+    if not info:
+        raise HTTPException(HTTPStatus.NOT_FOUND, "Media file not found")
+
+    file_size = info["size"]
+    range_header = request.headers.get("range") or request.headers.get("Range")
+    parsed = parse_range_header(range_header, file_size) if range_header else None
+
+    common_headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": f'inline; filename="{item_id}"',
+        "Cache-Control": "private, no-store",
+    }
+
+    if request.method == "HEAD":
+        return Response(
+            content=b"",
+            media_type=info["content_type"],
+            headers={**common_headers, "Content-Length": str(file_size)},
+        )
+
+    if parsed is None:
+        # Full body
+        def iter_full():
+            with open(info["file_path"], "rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    yield chunk
+
+        return StreamingResponse(
+            iter_full(),
+            media_type=info["content_type"],
+            headers={**common_headers, "Content-Length": str(file_size)},
+        )
+
+    # Partial body
+    start, end = parsed
+    length = end - start + 1
+    return StreamingResponse(
+        iter_file_range(info["file_path"], start, end),
+        status_code=HTTPStatus.PARTIAL_CONTENT,
+        media_type=info["content_type"],
+        headers={
+            **common_headers,
+            "Content-Range": f"bytes {start}-{end}/{file_size}",
+            "Content-Length": str(length),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Coupons
+# ---------------------------------------------------------------------------
+
+
+@contentwall_api_router.get("/api/v1/items/{item_id}/coupons")
+async def api_coupon_list(
+    item_id: str, wallet: WalletTypeInfo = Depends(require_admin_key)
+):
+    item = await get_item(item_id)
+    if not item:
+        raise HTTPException(HTTPStatus.NOT_FOUND, "Item not found")
+    if item.wallet != wallet.wallet.id:
+        raise HTTPException(HTTPStatus.FORBIDDEN, "Not your item")
+    return await list_coupons(item_id)
+
+
+@contentwall_api_router.post("/api/v1/items/{item_id}/coupons")
+async def api_coupon_create(
+    item_id: str,
+    data: CreateCoupon,
+    wallet: WalletTypeInfo = Depends(require_admin_key),
+):
+    item = await get_item(item_id)
+    if not item:
+        raise HTTPException(HTTPStatus.NOT_FOUND, "Item not found")
+    if item.wallet != wallet.wallet.id:
+        raise HTTPException(HTTPStatus.FORBIDDEN, "Not your item")
+    if data.discount_percent == 0 and data.discount_fixed_sats == 0:
+        raise HTTPException(
+            HTTPStatus.BAD_REQUEST,
+            "Coupon must set either discount_percent or discount_fixed_sats",
+        )
+    return await create_coupon(item_id, data)
+
+
+@contentwall_api_router.delete("/api/v1/items/{item_id}/coupons/{coupon_id}")
+async def api_coupon_delete(
+    item_id: str,
+    coupon_id: str,
+    wallet: WalletTypeInfo = Depends(require_admin_key),
+):
+    item = await get_item(item_id)
+    if not item:
+        raise HTTPException(HTTPStatus.NOT_FOUND, "Item not found")
+    if item.wallet != wallet.wallet.id:
+        raise HTTPException(HTTPStatus.FORBIDDEN, "Not your item")
+    await delete_coupon(coupon_id)
+    return {"deleted": True}
+
+
+@contentwall_api_router.get("/api/v1/items/{item_id}/coupons/check/{code}")
+async def api_coupon_check(item_id: str, code: str):
+    """
+    Public preview: returns whether a code is valid and the discounted price.
+    Used by the public page to show 'You'll pay X sats with this code'
+    without exposing other coupons or admin info.
+    """
+    item = await get_item(item_id)
+    if not item:
+        raise HTTPException(HTTPStatus.NOT_FOUND, "Item not found")
+    coupon = await get_coupon(item_id, code)
+    if not coupon:
+        return {"valid": False, "reason": "Unknown code"}
+    if coupon.uses_remaining == 0:
+        return {"valid": False, "reason": "Code is exhausted"}
+    if coupon.expires_at:
+        try:
+            exp = datetime.fromisoformat(coupon.expires_at.replace("Z", "+00:00"))
+            if datetime.now(timezone.utc) > exp:
+                return {"valid": False, "reason": "Code has expired"}
+        except Exception:
+            pass
+    new_price = apply_coupon_to_amount(item.amount, coupon)
+    return {
+        "valid": True,
+        "original_amount": item.amount,
+        "discounted_amount": new_price,
+        "savings": item.amount - new_price,
+        "currency": item.currency,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tips
+# ---------------------------------------------------------------------------
+
+
+@contentwall_api_router.post("/api/v1/items/{item_id}/tip")
+async def api_tip_create(item_id: str, data: CreateTipData):
+    """Create a tip invoice. Anyone can tip — even without paying first."""
+    item = await get_item(item_id)
+    if not item:
+        raise HTTPException(HTTPStatus.NOT_FOUND, "Item not found")
+    if not item.allow_tips:
+        raise HTTPException(HTTPStatus.GONE, "Tips disabled for this item")
+    if data.amount < 1:
+        raise HTTPException(HTTPStatus.BAD_REQUEST, "Amount must be >= 1 sat")
+
+    try:
+        payment = await create_invoice(
+            wallet_id=item.wallet,
+            amount=data.amount,
+            memo=f"Tip: {item.title}",
+            extra={
+                "tag": "contentwall_tip",
+                "id": item_id,
+                "paywall_payment_hash": data.paywall_payment_hash or "",
+            },
+        )
+        return {
+            "payment_hash": payment.payment_hash,
+            "payment_request": payment.bolt11,
+        }
+    except Exception as exc:
+        logger.error(f"Tip invoice creation failed: {exc}")
+        raise HTTPException(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc)) from exc
+
+
+@contentwall_api_router.post("/api/v1/items/{item_id}/tip/check")
+async def api_tip_check(item_id: str, data: CheckPaymentData):
+    """Poll a tip invoice and record it on confirmation."""
+    item = await get_item(item_id)
+    if not item:
+        raise HTTPException(HTTPStatus.NOT_FOUND, "Item not found")
+
+    try:
+        from lnbits.core.crud import get_standalone_payment
+        from lnbits.core.services import check_transaction_status
+
+        status = await check_transaction_status(item.wallet, data.payment_hash)
+        if status.pending:
+            return {"paid": False}
+        payment = await get_standalone_payment(
+            checking_id_or_hash=data.payment_hash,
+            incoming=True,
+            wallet_id=item.wallet,
+        )
+        if not payment:
+            return {"paid": False}
+        extra = _parse_extra(payment)
+        if extra.get("tag") != "contentwall_tip" or extra.get("id") != item_id:
+            return {"paid": False}
+        amount_sats = int(payment.amount / 1000)
+        # Avoid double-recording
+        existing = await db.fetchone(
+            "SELECT 1 FROM contentwall.tips WHERE tip_payment_hash = :h",
+            {"h": data.payment_hash},
+        )
+        if not existing:
+            await record_tip(
+                item_id=item_id,
+                tip_payment_hash=data.payment_hash,
+                amount_sats=amount_sats,
+                paywall_payment_hash=extra.get("paywall_payment_hash") or None,
+            )
+        return {"paid": True, "amount_sats": amount_sats}
+    except Exception as exc:
+        logger.error(f"Tip check failed: {exc}")
+        return {"paid": False}
+
+
+@contentwall_api_router.get("/api/v1/items/{item_id}/tips")
+async def api_tips_list(
+    item_id: str, wallet: WalletTypeInfo = Depends(require_invoice_key)
+):
+    item = await get_item(item_id)
+    if not item:
+        raise HTTPException(HTTPStatus.NOT_FOUND, "Item not found")
+    if item.wallet != wallet.wallet.id:
+        raise HTTPException(HTTPStatus.FORBIDDEN, "Not your item")
+    return await list_tips_for_item(item_id)
+
+
+@contentwall_api_router.get("/api/v1/stats/tips_total")
+async def api_tips_total(
+    wallet: WalletTypeInfo = Depends(require_invoice_key),
+    all_wallets: bool = Query(False),
+):
+    wallet_ids = [wallet.wallet.id]
+    if all_wallets:
+        from lnbits.core.crud import get_user
+        user = await get_user(wallet.wallet.user)
+        wallet_ids = user.wallet_ids if user else []
+    return {"total_sats": await get_tips_total(wallet_ids)}
+
+
+# ---------------------------------------------------------------------------
+# My purchases (anonymous, by payment_hash lookup)
+# ---------------------------------------------------------------------------
+
+
+class _MyPurchasesQuery(__import__('pydantic').BaseModel):
+    hashes: List[str] = []
+
+
+@contentwall_api_router.post("/api/v1/me/purchases")
+async def api_my_purchases(payload: _MyPurchasesQuery):
+    """
+    Returns the items + signed access URLs for a list of payment_hashes
+    the client kept in localStorage. We only confirm what's already in our DB,
+    so there's no privacy leak: knowing a payment_hash already proves access.
+    """
+    return await get_purchases_by_hashes(payload.hashes or [])
+
+
+# ---------------------------------------------------------------------------
+# Embed widget (iframe-safe + snippet)
+# ---------------------------------------------------------------------------
+
+
+@contentwall_api_router.get("/api/v1/items/{item_id}/embed-snippet")
+async def api_embed_snippet(request: Request, item_id: str):
+    """
+    Returns a copy-paste-ready HTML snippet a creator can drop in any blog
+    or site. Renders the paywall in a sandboxed iframe.
+    """
+    item = await get_item(item_id)
+    if not item:
+        raise HTTPException(HTTPStatus.NOT_FOUND, "Item not found")
+    base = str(request.base_url).rstrip("/")
+    snippet = (
+        f'<iframe src="{base}/contentwall/embed/{item_id}" '
+        f'style="width:100%;max-width:520px;height:680px;border:0;'
+        f'border-radius:12px;box-shadow:0 0 24px rgba(255,107,0,.35);" '
+        f'sandbox="allow-scripts allow-same-origin allow-popups allow-forms" '
+        f'loading="lazy" '
+        f'title="{item.title} — Lightning paywall"></iframe>'
+    )
+    return {"snippet": snippet, "embed_url": f"{base}/contentwall/embed/{item_id}"}
+
+
+# ---------------------------------------------------------------------------
+# Backup / restore (admin)
+# ---------------------------------------------------------------------------
+
+
+@contentwall_api_router.get("/api/v1/backup")
+async def api_backup(
+    wallet: WalletTypeInfo = Depends(require_admin_key),
+    all_wallets: bool = Query(False),
+):
+    """
+    JSON snapshot of items, payments, coupons, tips, bundle files for
+    the user's wallets. Does NOT include the actual content bytes — just
+    metadata so the creator can re-import structure elsewhere.
+    """
+    wallet_ids = [wallet.wallet.id]
+    if all_wallets:
+        from lnbits.core.crud import get_user
+        user = await get_user(wallet.wallet.user)
+        wallet_ids = user.wallet_ids if user else []
+
+    items = await get_items(wallet_ids, include_archived=True)
+    out_items = []
+    for it in items:
+        d = it.dict()
+        d.pop("access_signing_key", None)
+        d["payments"] = [p.dict() for p in await list_payments_for_item(it.id)]
+        d["coupons"] = [c.dict() for c in await list_coupons(it.id)]
+        d["tips"] = [t.dict() for t in await list_tips_for_item(it.id)]
+        d["files"] = [f.dict() for f in await get_item_files(it.id)]
+        out_items.append(d)
+    return {
+        "version": "1.2.0",
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "items": out_items,
+    }

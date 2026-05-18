@@ -8,6 +8,93 @@
 
 {% block page %}
 
+<!-- Coupon manager dialog -->
+<q-dialog v-model="couponDialog.show">
+  <q-card class="q-pa-lg" style="min-width: 540px;">
+    <div class="text-h6 q-mb-md">Coupons for "<span v-text="couponDialog.title"></span>"</div>
+
+    <q-table :rows="couponDialog.coupons" row-key="id" dense flat
+      :columns="[
+        {name: 'code', label: 'Code', field: 'code', align: 'left'},
+        {name: 'discount', label: 'Discount', align: 'left'},
+        {name: 'uses', label: 'Uses', align: 'center'},
+        {name: 'expires', label: 'Expires', align: 'left'},
+        {name: 'actions', label: '', align: 'right'},
+      ]">
+      <template v-slot:body="props">
+        <q-tr :props="props">
+          <q-td><strong v-text="props.row.code"></strong></q-td>
+          <q-td>
+            <span v-if="props.row.discount_percent" v-text="props.row.discount_percent + '%'"></span>
+            <span v-if="props.row.discount_percent && props.row.discount_fixed_sats"> + </span>
+            <span v-if="props.row.discount_fixed_sats" v-text="props.row.discount_fixed_sats + ' sats'"></span>
+          </q-td>
+          <q-td class="text-center">
+            <span v-text="props.row.uses_count"></span>
+            <span v-if="props.row.uses_remaining >= 0">/ <span v-text="props.row.uses_count + props.row.uses_remaining"></span></span>
+            <span v-else> / ∞</span>
+          </q-td>
+          <q-td>
+            <span v-if="props.row.expires_at" v-text="props.row.expires_at.slice(0, 16).replace('T', ' ')"></span>
+            <span v-else class="text-grey">never</span>
+          </q-td>
+          <q-td class="text-right">
+            <q-btn flat round size="sm" color="negative" icon="delete"
+              @click="deleteCoupon(props.row)"></q-btn>
+          </q-td>
+        </q-tr>
+      </template>
+      <template v-slot:no-data>
+        <div class="text-center q-pa-md text-grey">No coupons yet.</div>
+      </template>
+    </q-table>
+
+    <q-separator class="q-my-md"></q-separator>
+
+    <div class="text-subtitle2 q-mb-sm">Create coupon</div>
+    <div class="row q-col-gutter-sm">
+      <div class="col-4">
+        <q-input filled dense v-model="couponDialog.draft.code" label="Code" maxlength="32"></q-input>
+      </div>
+      <div class="col-4">
+        <q-input filled dense v-model.number="couponDialog.draft.discount_percent" type="number" label="% off" min="0" max="100"></q-input>
+      </div>
+      <div class="col-4">
+        <q-input filled dense v-model.number="couponDialog.draft.discount_fixed_sats" type="number" label="sat off" min="0"></q-input>
+      </div>
+      <div class="col-6">
+        <q-input filled dense v-model.number="couponDialog.draft.uses_remaining" type="number"
+          label="Uses (-1 = unlimited)"></q-input>
+      </div>
+      <div class="col-6">
+        <q-input filled dense v-model="couponDialog.draft.expires_at" type="datetime-local"
+          label="Expires (optional)"></q-input>
+      </div>
+    </div>
+
+    <q-card-actions align="right">
+      <q-btn flat color="grey" v-close-popup>Close</q-btn>
+      <q-btn unelevated color="primary" @click="createCoupon"
+        :loading="couponDialog.creating">Create</q-btn>
+    </q-card-actions>
+  </q-card>
+</q-dialog>
+
+<!-- Embed snippet dialog -->
+<q-dialog v-model="embedDialog.show">
+  <q-card class="q-pa-lg" style="min-width: 560px;">
+    <div class="text-h6 q-mb-md">Embed "<span v-text="embedDialog.title"></span>"</div>
+    <div class="text-caption text-grey q-mb-sm">
+      Paste this snippet into any HTML page (blog, Substack, Ghost…) to embed the paywall:
+    </div>
+    <q-input filled v-model="embedDialog.snippet" type="textarea" readonly autogrow></q-input>
+    <q-card-actions align="right">
+      <q-btn flat color="grey" v-close-popup>Close</q-btn>
+      <q-btn unelevated color="primary" icon="content_copy" @click="copyEmbedSnippet" no-caps>Copy snippet</q-btn>
+    </q-card-actions>
+  </q-card>
+</q-dialog>
+
 <!-- Create / edit dialog -->
 <q-dialog v-model="itemDialog.show" position="top" persistent>
   <q-card class="q-pa-lg q-pt-xl lnbits__dialog-card" style="min-width: 500px; max-width: 760px;">
@@ -24,6 +111,8 @@
         :options="[
           {label: 'Article (text)', value: 'article'},
           {label: 'Image (single file)', value: 'image'},
+          {label: 'Audio (mp3/m4a/ogg/wav)', value: 'audio'},
+          {label: 'Video (mp4/webm)', value: 'video'},
           {label: 'Bundle (multiple files)', value: 'bundle'},
         ]"
         option-value="value" option-label="label" label="Content Type *"
@@ -33,11 +122,25 @@
         v-model="itemDialog.data.article_content"
         type="textarea" label="Article Content *" rows="10" class="q-mt-md"></q-input>
 
+      <q-toggle v-if="itemDialog.data.content_type === 'article'"
+        v-model="itemDialog.data.markdown"
+        label="Render article as Markdown (headings, lists, code blocks)"></q-toggle>
+
       <div v-if="itemDialog.data.content_type === 'image' && !itemDialog.data.id" class="q-mt-md">
         <q-file filled v-model="itemDialog.data.image_file" label="Upload Image *"
           accept=".jpg,.jpeg,.png,.gif,.webp" @update:model-value="onImageSelected">
           <template v-slot:prepend><q-icon name="attach_file"></q-icon></template>
         </q-file>
+      </div>
+
+      <div v-if="(itemDialog.data.content_type === 'audio' || itemDialog.data.content_type === 'video') && !itemDialog.data.id" class="q-mt-md">
+        <q-file filled v-model="itemDialog.data.media_file"
+          :label="(itemDialog.data.content_type === 'audio' ? 'Upload audio file *' : 'Upload video file *')"
+          :accept="itemDialog.data.content_type === 'audio' ? 'audio/*' : 'video/*'"
+          @update:model-value="onMediaSelected">
+          <template v-slot:prepend><q-icon name="upload_file"></q-icon></template>
+        </q-file>
+        <div class="text-caption q-mt-xs">Files are streamed with HTTP Range, so seek works for buyers.</div>
       </div>
 
       <div v-if="itemDialog.data.content_type === 'bundle' && !itemDialog.data.id" class="q-mt-md">
@@ -94,6 +197,9 @@
 
       <q-separator class="q-my-md"></q-separator>
       <div class="text-subtitle2 text-grey q-mb-sm">Integrations</div>
+
+      <q-toggle v-model="itemDialog.data.allow_tips"
+        label="Allow tips after unlock (show 'tip the creator' button)"></q-toggle>
 
       <q-input filled dense v-model="itemDialog.data.webhook_url"
         label="Webhook URL on payment (optional)"
@@ -238,6 +344,12 @@
                   <q-btn flat round color="orange" icon="bar_chart" size="sm" @click="openStats(props.row)">
                     <q-tooltip>Stats</q-tooltip>
                   </q-btn>
+                  <q-btn flat round color="purple" icon="local_offer" size="sm" @click="openCoupons(props.row)">
+                    <q-tooltip>Coupons</q-tooltip>
+                  </q-btn>
+                  <q-btn flat round color="teal" icon="integration_instructions" size="sm" @click="openEmbed(props.row)">
+                    <q-tooltip>Embed snippet</q-tooltip>
+                  </q-btn>
                   <q-btn flat round color="secondary" icon="edit" size="sm" @click="openEditDialog(props.row)">
                     <q-tooltip>Edit</q-tooltip>
                   </q-btn>
@@ -273,7 +385,15 @@
             <div class="text-h5" v-text="totalSats + ' sat'"></div>
             <div class="text-caption text-grey">earned</div>
           </div>
+          <div class="col-12">
+            <div class="text-h6" style="color: #ff2a45;">⚡ <span v-text="tipsTotal + ' sat'"></span></div>
+            <div class="text-caption text-grey">in tips</div>
+          </div>
         </div>
+        <q-separator class="q-my-md"></q-separator>
+        <q-btn outline color="primary" icon="cloud_download" no-caps class="full-width" @click="downloadBackup">
+          Download backup (JSON)
+        </q-btn>
       </q-card-section>
     </q-card>
 

@@ -185,3 +185,151 @@ def article_teaser(article_text: str, length: int = 280) -> str:
     if last_space > length // 2:
         cut = cut[:last_space]
     return cut + "…"
+
+
+# ---------------------------------------------------------------------------
+# Range header parsing for audio/video streaming
+# ---------------------------------------------------------------------------
+
+
+def parse_range_header(range_header: str, file_size: int) -> Optional[tuple[int, int]]:
+    """
+    Parse a HTTP Range header like 'bytes=0-1023' and clamp to the file size.
+    Returns (start, end_inclusive) or None if malformed / non-bytes / unsatisfiable.
+
+    Only the first range is honored (multi-range responses are out of scope).
+    """
+    if not range_header or not range_header.startswith("bytes="):
+        return None
+    try:
+        spec = range_header[len("bytes="):].split(",")[0].strip()
+        if "-" not in spec:
+            return None
+        a, b = spec.split("-", 1)
+        if a == "" and b:
+            # "bytes=-N" = last N bytes
+            length = int(b)
+            start = max(0, file_size - length)
+            end = file_size - 1
+        elif a and b == "":
+            # "bytes=N-" = from N to end
+            start = int(a)
+            end = file_size - 1
+        else:
+            start = int(a)
+            end = int(b)
+        if start < 0 or start >= file_size:
+            return None
+        end = min(end, file_size - 1)
+        if end < start:
+            return None
+        return start, end
+    except (ValueError, AttributeError):
+        return None
+
+
+def iter_file_range(path: str, start: int, end: int, chunk: int = 65536):
+    """Yield bytes in [start, end] inclusive from a file."""
+    remaining = end - start + 1
+    with open(path, "rb") as f:
+        f.seek(start)
+        while remaining > 0:
+            data = f.read(min(chunk, remaining))
+            if not data:
+                break
+            remaining -= len(data)
+            yield data
+
+
+# ---------------------------------------------------------------------------
+# Markdown rendering (best-effort, server-side)
+# ---------------------------------------------------------------------------
+
+
+def render_markdown_safe(text: str) -> str:
+    """
+    Render markdown to HTML using mistune if available, else escape and wrap.
+    Includes a basic XSS sanitizer that strips raw <script>/<style>/<iframe>.
+    Falls back to pre-formatted plain text if no markdown lib is installed.
+    """
+    if not text:
+        return ""
+    try:
+        import mistune
+        md = mistune.create_markdown(escape=True, hard_wrap=True)
+        html = md(text)
+    except Exception:
+        # Plain fallback: escape and preserve line breaks
+        import html as _html
+        return f'<div class="cw-plain">{_html.escape(text)}</div>'
+
+    # Strip dangerous tags defensively. mistune with escape=True already
+    # escapes raw HTML, but we add a belt-and-suspenders pass.
+    import re as _re
+    for bad in ("script", "style", "iframe", "object", "embed"):
+        html = _re.sub(
+            rf"<{bad}.*?>.*?</{bad}>", "", html, flags=_re.IGNORECASE | _re.DOTALL
+        )
+        html = _re.sub(rf"<{bad}[^>]*/?>", "", html, flags=_re.IGNORECASE)
+    # Strip event handlers like onclick=
+    html = _re.sub(r"\son\w+=\"[^\"]*\"", "", html, flags=_re.IGNORECASE)
+    html = _re.sub(r"\son\w+='[^']*'", "", html, flags=_re.IGNORECASE)
+    html = _re.sub(r"javascript:", "", html, flags=_re.IGNORECASE)
+    return html
+
+
+# ---------------------------------------------------------------------------
+# In-memory rate limiter (per-IP, fixed window)
+# ---------------------------------------------------------------------------
+
+
+from collections import deque  # noqa: E402
+from threading import Lock     # noqa: E402
+
+_rate_state: dict[str, deque] = {}
+_rate_lock = Lock()
+
+
+def rate_limit_check(
+    key: str, max_requests: int = 10, window_seconds: int = 60
+) -> bool:
+    """
+    Return True if the call is allowed, False if rate-limited.
+
+    Stores a deque of recent timestamps per key. Old entries are popped on
+    every call so memory stays bounded. This is per-process and per-instance
+    — fine for a single-server LNbits node, which is the common deployment.
+    """
+    import time
+    now = time.time()
+    cutoff = now - window_seconds
+    with _rate_lock:
+        q = _rate_state.setdefault(key, deque())
+        while q and q[0] < cutoff:
+            q.popleft()
+        if len(q) >= max_requests:
+            return False
+        q.append(now)
+        return True
+
+
+# ---------------------------------------------------------------------------
+# OG / Twitter / Nostr meta tag builder
+# ---------------------------------------------------------------------------
+
+
+def build_share_meta(title: str, description: str, page_url: str,
+                     preview_image_url: Optional[str] = None) -> dict:
+    """
+    Returns a dict consumed by display.html to render Open Graph, Twitter
+    Card and Nostr-ish meta tags. Keep titles ≤60 chars and descriptions
+    ≤200 to play nice with Twitter / Nostr clients.
+    """
+    safe_title = (title or "Content")[:60]
+    safe_desc = (description or "")[:200]
+    return {
+        "title": safe_title,
+        "description": safe_desc,
+        "url": page_url,
+        "image": preview_image_url or "",
+    }
