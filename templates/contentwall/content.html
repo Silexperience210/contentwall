@@ -1,58 +1,111 @@
 {% extends "public.html" %}
 
+{% block styles %}
+<style>
+  :root {
+    --cw-orange: #ff6b00;
+    --cw-red:    #ff2a45;
+    --cw-glow:   0 0 24px rgba(255, 107, 0, 0.35);
+  }
+  body { background: radial-gradient(ellipse at top, #1a1320 0%, #0a0814 70%); }
+  .cw-card {
+    background: linear-gradient(160deg, rgba(40,20,30,0.85), rgba(15,10,20,0.95));
+    border: 1px solid rgba(255, 107, 0, 0.25);
+    box-shadow: var(--cw-glow);
+    color: #f5f1e8;
+  }
+  .cw-card .text-grey,
+  .cw-card .text-caption { color: #b9aeb6 !important; }
+  .cw-title { font-family: monospace; letter-spacing: 0.04em; }
+  .article-content {
+    background: rgba(255,107,0,0.04);
+    border-left: 3px solid var(--cw-orange);
+    border-radius: 4px;
+    padding: 24px;
+    line-height: 1.8;
+    white-space: pre-wrap;
+    font-size: 16px;
+    color: #f5f1e8;
+  }
+  .image-content img {
+    max-width: 100%;
+    border-radius: 8px;
+    border: 1px solid rgba(255,107,0,0.25);
+    box-shadow: var(--cw-glow);
+  }
+  .cw-file {
+    background: rgba(255,107,0,0.05);
+    border: 1px solid rgba(255,107,0,0.2);
+    border-radius: 6px;
+    padding: 12px 16px;
+    margin-bottom: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-family: monospace;
+  }
+</style>
+{% endblock %}
+
 {% block page %}
-<div class="row q-col-gutter-md justify-center">
+<div class="row q-col-gutter-md justify-center q-pa-md">
   <div class="col-12 col-md-10 col-lg-8">
-    <q-card class="q-pa-lg">
+    <q-card class="cw-card q-pa-lg">
       <q-card-section>
         <div class="row items-center q-mb-md">
-          <q-icon name="visibility" color="positive" size="32px" class="q-mr-md"></q-icon>
+          <q-icon name="lock_open" color="positive" size="32px" class="q-mr-md"></q-icon>
           <div>
-            <div class="text-h5 q-mb-xs">{{ title }}</div>
-            <div class="text-caption text-grey">Unlocked content</div>
+            <div class="text-h5 cw-title q-mb-xs">{{ title }}</div>
+            <div class="text-caption">// UNLOCKED CONTENT</div>
           </div>
         </div>
 
-        <q-separator class="q-my-md"></q-separator>
+        <q-separator dark class="q-my-md" style="background: rgba(255,107,0,0.3);"></q-separator>
 
         {% if description %}
         <p class="text-body1 text-grey q-mb-lg">{{ description }}</p>
         {% endif %}
 
         {% if content_type == 'article' %}
-        <div class="article-content">
-          <div class="text-body1" style="line-height: 1.8; white-space: pre-wrap;">{{ article_content }}</div>
-        </div>
+        <div class="article-content">{{ article_content }}</div>
         {% elif content_type == 'image' %}
         <div class="image-content text-center">
-          <img src="{{ image_data }}" alt="{{ title }}" style="max-width: 100%; border-radius: 8px;" />
+          <img src="{{ image_data }}" alt="{{ title }}" />
+        </div>
+        {% elif content_type == 'bundle' %}
+        <div>
+          <div class="text-subtitle2 q-mb-md">
+            <q-icon name="folder_zip" class="q-mr-xs" style="color: var(--cw-orange);"></q-icon>
+            Files in this bundle:
+          </div>
+          {% for f in bundle_files %}
+          <div class="cw-file">
+            <div>
+              <q-icon name="insert_drive_file" class="q-mr-sm" style="color: var(--cw-orange);"></q-icon>
+              <strong>{{ f.filename }}</strong>
+              <span class="text-caption q-ml-sm">{{ (f.size / 1024) | round(1) }} KB</span>
+            </div>
+            <q-btn outline color="orange" size="sm" no-caps icon="download"
+              href="/contentwall/api/v1/items/file/{{ item_id }}/{{ f.id }}?payment_hash={{ payment_hash }}&t={{ access_token }}"
+              download
+            >Download</q-btn>
+          </div>
+          {% endfor %}
         </div>
         {% endif %}
 
-        <q-separator class="q-my-lg"></q-separator>
+        <q-separator dark class="q-my-lg" style="background: rgba(255,107,0,0.3);"></q-separator>
 
         <div class="row items-center justify-between">
-          <div class="text-caption text-grey">
-            <q-icon name="security" size="xs" class="q-mr-xs"></q-icon>
+          <div class="text-caption">
+            <q-icon name="security" size="xs" class="q-mr-xs" style="color: var(--cw-orange);"></q-icon>
             Content secured by Lightning
           </div>
-          <q-btn flat color="primary" icon="replay" size="sm" onclick="window.location.reload()">Refresh</q-btn>
+          <q-btn flat color="orange" icon="replay" size="sm" no-caps
+            onclick="window.location.reload()">Refresh</q-btn>
         </div>
       </q-card-section>
     </q-card>
   </div>
 </div>
-{% endblock %}
-
-{% block styles %}
-<style>
-  .article-content {
-    background: rgba(128, 128, 128, 0.05);
-    border-radius: 8px;
-    padding: 24px;
-  }
-  .image-content img {
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
-  }
-</style>
 {% endblock %}

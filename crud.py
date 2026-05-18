@@ -1,18 +1,21 @@
 """
-ContentWall CRUD - following the exact paywall extension pattern.
+ContentWall CRUD layer.
 """
 
 from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import os
-from datetime import datetime, timezone
+import secrets
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 from lnbits.db import Database
 from lnbits.helpers import urlsafe_short_hash
 
-from .models import CreateItem, Item, Payment
+from .models import CreateItem, Item, ItemFile, ItemStats, Payment, UpdateItem
 
 db = Database("ext_contentwall")
 
@@ -25,6 +28,15 @@ def _ensure_files_dir():
 
 def _hash_content(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
+
+
+def _new_signing_key() -> str:
+    return secrets.token_urlsafe(32)
+
+
+# ---------------------------------------------------------------------------
+# Items
+# ---------------------------------------------------------------------------
 
 
 async def create_item(wallet_id: str, data: CreateItem) -> Item:
@@ -46,9 +58,114 @@ async def create_item(wallet_id: str, data: CreateItem) -> Item:
         scheduled_at=data.scheduled_at,
         onion_hostname=data.onion_hostname,
         created_at=now,
+        teaser_text=data.teaser_text,
+        teaser_blur=1 if data.teaser_blur else 0,
+        access_duration_seconds=data.access_duration_seconds,
+        access_signing_key=_new_signing_key(),
+        webhook_url=data.webhook_url,
+        max_views=data.max_views,
     )
     await db.insert("contentwall.items", item)
     return item
+
+
+async def get_item(item_id: str) -> Optional[Item]:
+    return await db.fetchone(
+        "SELECT * FROM contentwall.items WHERE id = :id",
+        {"id": item_id},
+        Item,
+    )
+
+
+async def get_items(
+    wallet_ids: list[str], include_archived: bool = False
+) -> list[Item]:
+    if not wallet_ids:
+        return []
+    q = ",".join([f"'{w}'" for w in wallet_ids])
+    where = f"wallet IN ({q})"
+    if not include_archived:
+        where += " AND archived_at IS NULL"
+    return await db.fetchall(
+        f"SELECT * FROM contentwall.items WHERE {where} ORDER BY created_at DESC",
+        model=Item,
+    )
+
+
+async def update_item(item_id: str, data: UpdateItem) -> Optional[Item]:
+    """Patch-style update. Only fields explicitly set are written."""
+    fields = data.dict(exclude_unset=True)
+    if not fields:
+        return await get_item(item_id)
+
+    # Translate the friendly 'archived' bool -> archived_at timestamp.
+    if "archived" in fields:
+        if fields.pop("archived"):
+            fields["archived_at"] = datetime.now(timezone.utc).isoformat()
+        else:
+            fields["archived_at"] = None
+
+    # Bool to int for sqlite compatibility on the fields we store as INTEGER.
+    for bool_field in ("remembers", "teaser_blur"):
+        if bool_field in fields and isinstance(fields[bool_field], bool):
+            fields[bool_field] = 1 if fields[bool_field] else 0
+
+    set_clause = ", ".join(f"{k} = :{k}" for k in fields.keys())
+    params = {**fields, "id": item_id}
+    await db.execute(
+        f"UPDATE contentwall.items SET {set_clause} WHERE id = :id", params
+    )
+    return await get_item(item_id)
+
+
+async def archive_item(item_id: str) -> None:
+    """Soft-delete: hide from admin list but keep payments+files for buyers."""
+    await db.execute(
+        "UPDATE contentwall.items SET archived_at = :now WHERE id = :id",
+        {"now": datetime.now(timezone.utc).isoformat(), "id": item_id},
+    )
+
+
+async def delete_item(item_id: str) -> None:
+    """Hard delete: wipes payments, files on disk and DB rows."""
+    for ext in [".article", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bin"]:
+        fp = os.path.join(FILES_DIR, f"{item_id}{ext}")
+        if os.path.exists(fp):
+            try:
+                os.remove(fp)
+            except OSError:
+                pass
+
+    # Bundle files
+    files = await get_item_files(item_id)
+    for f in files:
+        fp = os.path.join(FILES_DIR, "bundles", item_id, f.id)
+        if os.path.exists(fp):
+            try:
+                os.remove(fp)
+            except OSError:
+                pass
+    bundle_dir = os.path.join(FILES_DIR, "bundles", item_id)
+    if os.path.isdir(bundle_dir):
+        try:
+            os.rmdir(bundle_dir)
+        except OSError:
+            pass
+
+    await db.execute(
+        "DELETE FROM contentwall.item_files WHERE item_id = :id", {"id": item_id}
+    )
+    await db.execute(
+        "DELETE FROM contentwall.payments WHERE item_id = :id", {"id": item_id}
+    )
+    await db.execute(
+        "DELETE FROM contentwall.items WHERE id = :id", {"id": item_id}
+    )
+
+
+# ---------------------------------------------------------------------------
+# Content storage
+# ---------------------------------------------------------------------------
 
 
 async def store_article_content(item_id: str, content: str) -> None:
@@ -86,87 +203,7 @@ async def store_image_file(item_id: str, upload_file) -> dict:
     }
 
 
-async def get_item(item_id: str) -> Item | None:
-    row = await db.fetchone(
-        "SELECT * FROM contentwall.items WHERE id = :id",
-        {"id": item_id},
-        Item,
-    )
-    return row
-
-
-async def get_items(wallet_ids: list[str]) -> list[Item]:
-    if not wallet_ids:
-        return []
-    q = ",".join([f"'{w}'" for w in wallet_ids])
-    rows = await db.fetchall(
-        f"SELECT * FROM contentwall.items WHERE wallet IN ({q})",
-        model=Item,
-    )
-    return rows
-
-
-async def delete_item(item_id: str) -> None:
-    for ext in [".article", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bin"]:
-        fp = os.path.join(FILES_DIR, f"{item_id}{ext}")
-        if os.path.exists(fp):
-            os.remove(fp)
-    await db.execute(
-        "DELETE FROM contentwall.payments WHERE item_id = :id", {"id": item_id}
-    )
-    await db.execute(
-        "DELETE FROM contentwall.items WHERE id = :id", {"id": item_id}
-    )
-
-
-async def record_payment(item_id: str, payment_hash: str, amount_paid: int) -> None:
-    now = datetime.now(timezone.utc).isoformat()
-    payment_id = urlsafe_short_hash()
-    payment = Payment(
-        id=payment_id,
-        item_id=item_id,
-        payment_hash=payment_hash,
-        amount_paid=amount_paid,
-        paid_at=now,
-        created_at=now,
-    )
-    await db.insert("contentwall.payments", payment)
-
-
-async def get_payment_timestamp(item_id: str, payment_hash: str) -> str | None:
-    row = await db.fetchone(
-        "SELECT paid_at FROM contentwall.payments WHERE item_id = :item_id AND payment_hash = :payment_hash",
-        {"item_id": item_id, "payment_hash": payment_hash},
-    )
-    if not row:
-        return None
-    # fetchone without a model returns a RowMapping (dict-like)
-    paid_at = row["paid_at"]
-    if paid_at is None:
-        return None
-    return paid_at if isinstance(paid_at, str) else paid_at.isoformat()
-
-
-async def has_paid(item_id: str, payment_hash: str) -> bool:
-    row = await db.fetchone(
-        "SELECT 1 FROM contentwall.payments WHERE item_id = :item_id AND payment_hash = :payment_hash",
-        {"item_id": item_id, "payment_hash": payment_hash},
-    )
-    return row is not None
-
-
-async def get_payment_amount(item_id: str, payment_hash: str) -> int:
-    row = await db.fetchone(
-        "SELECT amount_paid FROM contentwall.payments WHERE item_id = :item_id AND payment_hash = :payment_hash",
-        {"item_id": item_id, "payment_hash": payment_hash},
-    )
-    if not row:
-        return 0
-    # fetchone without a model returns a RowMapping (dict-like)
-    return int(row["amount_paid"]) if row["amount_paid"] is not None else 0
-
-
-async def get_article_content(item_id: str) -> str | None:
+async def get_article_content(item_id: str) -> Optional[str]:
     fp = os.path.join(FILES_DIR, f"{item_id}.article")
     if not os.path.exists(fp):
         return None
@@ -174,7 +211,7 @@ async def get_article_content(item_id: str) -> str | None:
         return f.read()
 
 
-async def get_image_file_info(item_id: str) -> dict | None:
+async def get_image_file_info(item_id: str) -> Optional[dict]:
     for ext, ct in [
         (".jpg", "image/jpeg"), (".jpeg", "image/jpeg"),
         (".png", "image/png"), (".gif", "image/gif"), (".webp", "image/webp"),
@@ -185,10 +222,325 @@ async def get_image_file_info(item_id: str) -> dict | None:
     return None
 
 
-async def get_image_base64(item_id: str) -> dict | None:
+async def get_image_base64(item_id: str) -> Optional[dict]:
     info = await get_image_file_info(item_id)
     if not info:
         return None
     with open(info["file_path"], "rb") as f:
         data = f.read()
-    return {"data": base64.b64encode(data).decode("ascii"), "content_type": info["content_type"]}
+    return {
+        "data": base64.b64encode(data).decode("ascii"),
+        "content_type": info["content_type"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Bundle files (multi-file items)
+# ---------------------------------------------------------------------------
+
+
+async def add_bundle_file(item_id: str, upload_file) -> ItemFile:
+    """Store an extra file as part of a bundle item."""
+    bundle_dir = os.path.join(FILES_DIR, "bundles", item_id)
+    os.makedirs(bundle_dir, exist_ok=True)
+
+    content = await upload_file.read()
+    content_hash = _hash_content(content)
+    file_id = urlsafe_short_hash()
+    file_path = os.path.join(bundle_dir, file_id)
+    with open(file_path, "wb") as f:
+        f.write(content)
+
+    # Determine next position
+    existing = await get_item_files(item_id)
+    next_position = (max((f.position for f in existing), default=-1)) + 1
+
+    bf = ItemFile(
+        id=file_id,
+        item_id=item_id,
+        filename=upload_file.filename or file_id,
+        content_type=upload_file.content_type or "application/octet-stream",
+        size=len(content),
+        content_hash=content_hash,
+        position=next_position,
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+    await db.insert("contentwall.item_files", bf)
+    return bf
+
+
+async def get_item_files(item_id: str) -> list[ItemFile]:
+    return await db.fetchall(
+        "SELECT * FROM contentwall.item_files WHERE item_id = :id ORDER BY position",
+        {"id": item_id},
+        model=ItemFile,
+    )
+
+
+async def get_item_file(file_id: str) -> Optional[ItemFile]:
+    return await db.fetchone(
+        "SELECT * FROM contentwall.item_files WHERE id = :id",
+        {"id": file_id},
+        ItemFile,
+    )
+
+
+async def delete_bundle_file(file_id: str) -> None:
+    bf = await get_item_file(file_id)
+    if not bf:
+        return
+    fp = os.path.join(FILES_DIR, "bundles", bf.item_id, bf.id)
+    if os.path.exists(fp):
+        try:
+            os.remove(fp)
+        except OSError:
+            pass
+    await db.execute(
+        "DELETE FROM contentwall.item_files WHERE id = :id", {"id": file_id}
+    )
+
+
+# ---------------------------------------------------------------------------
+# Payments
+# ---------------------------------------------------------------------------
+
+
+async def record_payment(
+    item_id: str,
+    payment_hash: str,
+    amount_paid: int,
+    access_duration_seconds: int = 0,
+) -> Payment:
+    now = datetime.now(timezone.utc)
+    expires_at = None
+    if access_duration_seconds and access_duration_seconds > 0:
+        expires_at = (now + timedelta(seconds=access_duration_seconds)).isoformat()
+    payment = Payment(
+        id=urlsafe_short_hash(),
+        item_id=item_id,
+        payment_hash=payment_hash,
+        amount_paid=amount_paid,
+        paid_at=now.isoformat(),
+        created_at=now.isoformat(),
+        expires_at=expires_at,
+        views_count=0,
+    )
+    await db.insert("contentwall.payments", payment)
+    return payment
+
+
+async def get_payment(item_id: str, payment_hash: str) -> Optional[Payment]:
+    return await db.fetchone(
+        """
+        SELECT * FROM contentwall.payments
+        WHERE item_id = :item_id AND payment_hash = :payment_hash
+        """,
+        {"item_id": item_id, "payment_hash": payment_hash},
+        Payment,
+    )
+
+
+async def get_payment_timestamp(item_id: str, payment_hash: str) -> Optional[str]:
+    row = await db.fetchone(
+        """
+        SELECT paid_at FROM contentwall.payments
+        WHERE item_id = :item_id AND payment_hash = :payment_hash
+        """,
+        {"item_id": item_id, "payment_hash": payment_hash},
+    )
+    if not row:
+        return None
+    paid_at = row["paid_at"]
+    if paid_at is None:
+        return None
+    return paid_at if isinstance(paid_at, str) else paid_at.isoformat()
+
+
+async def has_paid(item_id: str, payment_hash: str) -> bool:
+    row = await db.fetchone(
+        """
+        SELECT 1 FROM contentwall.payments
+        WHERE item_id = :item_id AND payment_hash = :payment_hash
+        """,
+        {"item_id": item_id, "payment_hash": payment_hash},
+    )
+    return row is not None
+
+
+async def get_payment_amount(item_id: str, payment_hash: str) -> int:
+    row = await db.fetchone(
+        """
+        SELECT amount_paid FROM contentwall.payments
+        WHERE item_id = :item_id AND payment_hash = :payment_hash
+        """,
+        {"item_id": item_id, "payment_hash": payment_hash},
+    )
+    if not row:
+        return 0
+    return int(row["amount_paid"]) if row["amount_paid"] is not None else 0
+
+
+async def increment_view_count(item_id: str, payment_hash: str) -> int:
+    """Increment views_count and return the new value."""
+    await db.execute(
+        """
+        UPDATE contentwall.payments
+        SET views_count = COALESCE(views_count, 0) + 1
+        WHERE item_id = :item_id AND payment_hash = :payment_hash
+        """,
+        {"item_id": item_id, "payment_hash": payment_hash},
+    )
+    row = await db.fetchone(
+        """
+        SELECT views_count FROM contentwall.payments
+        WHERE item_id = :item_id AND payment_hash = :payment_hash
+        """,
+        {"item_id": item_id, "payment_hash": payment_hash},
+    )
+    if not row or row["views_count"] is None:
+        return 0
+    return int(row["views_count"])
+
+
+async def is_payment_expired(item_id: str, payment_hash: str) -> bool:
+    payment = await get_payment(item_id, payment_hash)
+    if not payment or not payment.expires_at:
+        return False
+    expires = datetime.fromisoformat(payment.expires_at.replace("Z", "+00:00"))
+    return datetime.now(timezone.utc) > expires
+
+
+async def list_payments_for_item(item_id: str) -> list[Payment]:
+    return await db.fetchall(
+        "SELECT * FROM contentwall.payments WHERE item_id = :id ORDER BY paid_at DESC",
+        {"id": item_id},
+        model=Payment,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stats
+# ---------------------------------------------------------------------------
+
+
+async def get_item_stats(item_id: str) -> ItemStats:
+    """Aggregated stats for a single item."""
+    row = await db.fetchone(
+        """
+        SELECT
+            COUNT(*) AS payment_count,
+            COALESCE(SUM(amount_paid), 0) AS total_sats,
+            COUNT(DISTINCT payment_hash) AS unique_payers,
+            MAX(paid_at) AS last_payment_at
+        FROM contentwall.payments
+        WHERE item_id = :id
+        """,
+        {"id": item_id},
+    )
+    if not row:
+        return ItemStats(item_id=item_id)
+    last = row["last_payment_at"]
+    if last is not None and not isinstance(last, str):
+        last = last.isoformat()
+    return ItemStats(
+        item_id=item_id,
+        payment_count=int(row["payment_count"] or 0),
+        total_sats=int(row["total_sats"] or 0),
+        unique_payers=int(row["unique_payers"] or 0),
+        last_payment_at=last,
+    )
+
+
+async def get_stats_for_wallets(wallet_ids: list[str]) -> dict[str, ItemStats]:
+    """Bulk stats keyed by item_id, for use in the admin table."""
+    if not wallet_ids:
+        return {}
+    q = ",".join([f"'{w}'" for w in wallet_ids])
+    rows = await db.fetchall(
+        f"""
+        SELECT
+            i.id AS item_id,
+            COUNT(p.id) AS payment_count,
+            COALESCE(SUM(p.amount_paid), 0) AS total_sats,
+            COUNT(DISTINCT p.payment_hash) AS unique_payers,
+            MAX(p.paid_at) AS last_payment_at
+        FROM contentwall.items i
+        LEFT JOIN contentwall.payments p ON p.item_id = i.id
+        WHERE i.wallet IN ({q})
+        GROUP BY i.id
+        """
+    )
+    out: dict[str, ItemStats] = {}
+    for r in rows:
+        last = r["last_payment_at"]
+        if last is not None and not isinstance(last, str):
+            last = last.isoformat()
+        out[r["item_id"]] = ItemStats(
+            item_id=r["item_id"],
+            payment_count=int(r["payment_count"] or 0),
+            total_sats=int(r["total_sats"] or 0),
+            unique_payers=int(r["unique_payers"] or 0),
+            last_payment_at=last,
+        )
+    return out
+
+
+async def get_payments_by_day(wallet_ids: list[str], days: int = 30) -> list[dict]:
+    """Daily aggregated payments for the wallet's items, for chart display."""
+    if not wallet_ids:
+        return []
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    q = ",".join([f"'{w}'" for w in wallet_ids])
+    rows = await db.fetchall(
+        f"""
+        SELECT
+            SUBSTR(p.paid_at, 1, 10) AS day,
+            COUNT(*) AS count,
+            COALESCE(SUM(p.amount_paid), 0) AS total_sats
+        FROM contentwall.payments p
+        JOIN contentwall.items i ON i.id = p.item_id
+        WHERE i.wallet IN ({q}) AND p.paid_at >= :cutoff
+        GROUP BY day
+        ORDER BY day ASC
+        """,
+        {"cutoff": cutoff},
+    )
+    return [
+        {
+            "day": r["day"],
+            "count": int(r["count"] or 0),
+            "total_sats": int(r["total_sats"] or 0),
+        }
+        for r in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Signed access (HMAC)
+# ---------------------------------------------------------------------------
+
+
+def make_access_token(signing_key: str, item_id: str, payment_hash: str) -> str:
+    """
+    Compact HMAC-SHA256 token bound to (item_id, payment_hash).
+
+    Format: <hex_digest_first_16_bytes>
+    Verified on every protected request -> URL tampering is detected.
+    """
+    if not signing_key:
+        return ""
+    mac = hmac.new(
+        signing_key.encode("utf-8"),
+        f"{item_id}:{payment_hash}".encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    return mac.hex()[:32]
+
+
+def verify_access_token(
+    signing_key: str, item_id: str, payment_hash: str, token: str
+) -> bool:
+    if not signing_key or not token:
+        return False
+    expected = make_access_token(signing_key, item_id, payment_hash)
+    return hmac.compare_digest(expected, token)

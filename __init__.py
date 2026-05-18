@@ -1,5 +1,5 @@
 """
-ContentWall - A real paywall extension for LNbits with server-side content storage.
+ContentWall - real paywall extension for LNbits with server-side content storage.
 """
 
 import asyncio

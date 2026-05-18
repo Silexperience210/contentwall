@@ -7,114 +7,173 @@
 {% endblock %}
 
 {% block page %}
+
+<!-- Create / edit dialog -->
 <q-dialog v-model="itemDialog.show" position="top" persistent>
-  <q-card class="q-pa-lg q-pt-xl lnbits__dialog-card" style="min-width: 500px; max-width: 700px;">
+  <q-card class="q-pa-lg q-pt-xl lnbits__dialog-card" style="min-width: 500px; max-width: 760px;">
     <q-form @submit="sendItemDialog" class="q-gutter-md">
-      <div class="text-h6 q-mb-md">New Content Item</div>
+      <div class="text-h6 q-mb-md" v-text="itemDialog.data.id ? 'Edit Content Item' : 'New Content Item'"></div>
 
       <q-input filled dense v-model.trim="itemDialog.data.title" label="Title *"
-        :rules="[val => !!val || 'Title is required']"
-      ></q-input>
+        :rules="[val => !!val || 'Title is required']"></q-input>
 
-      <q-input filled dense v-model="itemDialog.data.description" type="textarea" label="Description" rows="2"
-      ></q-input>
+      <q-input filled dense v-model="itemDialog.data.description" type="textarea"
+        label="Description" rows="2"></q-input>
 
-      <q-select filled dense v-model="itemDialog.data.content_type"
-        :options="[{label: 'Article (text)', value: 'article'}, {label: 'Image (file)', value: 'image'}]"
-        option-value="value" option-label="label" label="Content Type *" emit-value map-options
-      ></q-select>
+      <q-select filled dense v-model="itemDialog.data.content_type" :disable="!!itemDialog.data.id"
+        :options="[
+          {label: 'Article (text)', value: 'article'},
+          {label: 'Image (single file)', value: 'image'},
+          {label: 'Bundle (multiple files)', value: 'bundle'},
+        ]"
+        option-value="value" option-label="label" label="Content Type *"
+        emit-value map-options></q-select>
 
-      <q-input v-if="itemDialog.data.content_type === 'article'" filled v-model="itemDialog.data.article_content"
-        type="textarea" label="Article Content *" rows="10" class="q-mt-md"
-      ></q-input>
+      <q-input v-if="itemDialog.data.content_type === 'article'" filled
+        v-model="itemDialog.data.article_content"
+        type="textarea" label="Article Content *" rows="10" class="q-mt-md"></q-input>
 
-      <div v-if="itemDialog.data.content_type === 'image'" class="q-mt-md">
+      <div v-if="itemDialog.data.content_type === 'image' && !itemDialog.data.id" class="q-mt-md">
         <q-file filled v-model="itemDialog.data.image_file" label="Upload Image *"
-          accept=".jpg,.jpeg,.png,.gif,.webp" @update:model-value="onImageSelected"
-        >
+          accept=".jpg,.jpeg,.png,.gif,.webp" @update:model-value="onImageSelected">
           <template v-slot:prepend><q-icon name="attach_file"></q-icon></template>
         </q-file>
       </div>
 
-      <q-separator class="q-my-md"></q-separator>
+      <div v-if="itemDialog.data.content_type === 'bundle' && !itemDialog.data.id" class="q-mt-md">
+        <q-file filled multiple v-model="itemDialog.data.bundle_files"
+          label="Upload bundle files *"
+          @update:model-value="onBundleSelected">
+          <template v-slot:prepend><q-icon name="folder_zip"></q-icon></template>
+        </q-file>
+        <div class="text-caption q-mt-xs">You can upload several files at once. They'll be downloadable individually.</div>
+      </div>
 
+      <q-separator class="q-my-md"></q-separator>
+      <div class="text-subtitle2 text-grey q-mb-sm">Preview / Teaser (#1)</div>
+
+      <q-input filled dense v-model="itemDialog.data.teaser_text" type="textarea" rows="2"
+        label="Teaser text (optional)"
+        hint="What unauthenticated visitors will see. For articles, the first 280 chars are used by default."></q-input>
+
+      <q-toggle v-model="itemDialog.data.teaser_blur" label="Blur the teaser to tease more"></q-toggle>
+
+      <q-separator class="q-my-md"></q-separator>
+      <div class="text-subtitle2 text-grey q-mb-sm">Pricing</div>
       <div class="row q-col-gutter-sm">
         <div class="col-6">
           <q-input filled dense v-model.number="itemDialog.data.amount" type="number" label="Amount *"
-            :rules="[val => val > 0 || 'Amount must be positive']"
-          ></q-input>
+            :rules="[val => val > 0 || 'Amount must be positive']"></q-input>
         </div>
         <div class="col-6">
-          <q-select filled dense v-model="itemDialog.data.currency" :options="['sat', 'usd', 'eur']" label="Currency"
-          ></q-select>
+          <q-select filled dense v-model="itemDialog.data.currency" :options="['sat', 'usd', 'eur']" label="Currency"></q-select>
         </div>
       </div>
-
-      <q-input filled dense v-model="itemDialog.data.memo" label="Memo (invoice description)"
-      ></q-input>
+      <q-input filled dense v-model="itemDialog.data.memo" label="Memo (invoice description)"></q-input>
 
       <q-separator class="q-my-md"></q-separator>
+      <div class="text-subtitle2 text-grey q-mb-sm">Access controls</div>
 
-      <div class="text-subtitle2 text-grey q-mb-sm">Scheduling</div>
+      <q-toggle v-model="itemDialog.data.remembers"
+        label="Remember payments (returning users keep access)"></q-toggle>
 
-      <q-input filled dense v-model="itemDialog.data.scheduled_at" type="datetime-local"
-        label="Scheduled publish date (optional)"
-        hint="Content will not be available before this date"
-      ></q-input>
+      <q-input filled dense v-model.number="itemDialog.data.access_duration_seconds" type="number"
+        label="Access duration (seconds, 0 = lifetime)"
+        hint="Sets an expiry per purchase. E.g. 86400 = 24h rental, 0 = forever."></q-input>
+
+      <q-input filled dense v-model.number="itemDialog.data.max_views" type="number"
+        label="Max views per purchase (0 = unlimited)"
+        hint="Caps how many times the same buyer can open the content."></q-input>
 
       <q-input filled dense v-model.number="itemDialog.data.release_delay_seconds" type="number"
         label="Release delay after payment (seconds)"
-        hint="Time to wait after payment before showing content. 0 = instant"
-      ></q-input>
+        hint="0 = instant. Useful for dropping content at the same time for everyone."></q-input>
+
+      <q-input filled dense v-model="itemDialog.data.scheduled_at" type="datetime-local"
+        label="Scheduled publish date (optional)"></q-input>
 
       <q-separator class="q-my-md"></q-separator>
+      <div class="text-subtitle2 text-grey q-mb-sm">Integrations</div>
 
-      <div class="text-subtitle2 text-grey q-mb-sm">Tor Onion (optional)</div>
+      <q-input filled dense v-model="itemDialog.data.webhook_url"
+        label="Webhook URL on payment (optional)"
+        hint="We POST {item_id, payment_hash, amount_sats, paid_at, expires_at} here on each confirmed payment."></q-input>
 
       <q-input filled dense v-model="itemDialog.data.onion_hostname"
-        label=".onion hostname (e.g. abc123...onion)"
-        hint="If set, an onion link will be generated for Tor users"
-      ></q-input>
-
-      <q-separator class="q-my-md"></q-separator>
-
-      <q-toggle v-model="itemDialog.data.remembers"
-        label="Remember payments (returning users keep access)"
-      ></q-toggle>
+        label=".onion hostname (optional)"></q-input>
 
       <div class="row q-mt-lg">
-        <q-btn unelevated color="primary" type="submit" :disable="!isFormValid" :loading="itemDialog.loading">
-          Create
-        </q-btn>
+        <q-btn unelevated color="primary" type="submit"
+          :disable="!isFormValid" :loading="itemDialog.loading"
+          v-text="itemDialog.data.id ? 'Save changes' : 'Create'"></q-btn>
         <q-btn v-close-popup flat color="grey" class="q-ml-auto">Cancel</q-btn>
       </div>
     </q-form>
   </q-card>
 </q-dialog>
 
-<q-dialog v-model="deleteDialog.show" position="top">
-  <q-card class="q-pa-lg q-pt-xl lnbits__dialog-card">
-    <q-card-section>
-      <div class="text-h6">Delete Content Item</div>
-      <p class="q-mt-md">Are you sure you want to delete this item?</p>
-      <p class="text-caption text-grey">This action cannot be undone.</p>
-    </q-card-section>
+<!-- Stats / details drawer -->
+<q-dialog v-model="statsDialog.show">
+  <q-card class="q-pa-lg" style="min-width: 600px;">
+    <div class="text-h6 q-mb-md" v-text="'Stats: ' + statsDialog.title"></div>
+    <div class="row q-col-gutter-md">
+      <div class="col-4">
+        <q-card flat bordered class="q-pa-md text-center">
+          <div class="text-caption text-grey">Payments</div>
+          <div class="text-h4" v-text="statsDialog.data.payment_count"></div>
+        </q-card>
+      </div>
+      <div class="col-4">
+        <q-card flat bordered class="q-pa-md text-center">
+          <div class="text-caption text-grey">Total revenue</div>
+          <div class="text-h4" v-text="statsDialog.data.total_sats + ' sats'"></div>
+        </q-card>
+      </div>
+      <div class="col-4">
+        <q-card flat bordered class="q-pa-md text-center">
+          <div class="text-caption text-grey">Unique buyers</div>
+          <div class="text-h4" v-text="statsDialog.data.unique_payers"></div>
+        </q-card>
+      </div>
+    </div>
+    <div class="text-caption text-grey q-mt-md" v-if="statsDialog.data.last_payment_at">
+      Last payment: <span v-text="statsDialog.data.last_payment_at"></span>
+    </div>
     <q-card-actions align="right">
-      <q-btn flat color="grey" @click="deleteDialog.show = false">Cancel</q-btn>
-      <q-btn unelevated color="negative" @click="confirmDelete" :loading="deleteDialog.loading">Delete</q-btn>
+      <q-btn flat color="grey" v-close-popup>Close</q-btn>
     </q-card-actions>
   </q-card>
 </q-dialog>
 
+<!-- Delete dialog -->
+<q-dialog v-model="deleteDialog.show" position="top">
+  <q-card class="q-pa-lg q-pt-xl lnbits__dialog-card">
+    <q-card-section>
+      <div class="text-h6">Delete or Archive?</div>
+      <p class="q-mt-md">"<span v-text="deleteDialog.item.title"></span>"</p>
+      <p class="text-caption text-grey">
+        <strong>Archive</strong> hides it from the list but keeps it accessible to buyers (recommended).<br>
+        <strong>Delete</strong> permanently wipes the item, all payments and files. Buyers lose access.
+      </p>
+    </q-card-section>
+    <q-card-actions align="right">
+      <q-btn flat color="grey" @click="deleteDialog.show = false">Cancel</q-btn>
+      <q-btn outline color="orange" @click="archiveItem(deleteDialog.item)" :loading="deleteDialog.loading">Archive</q-btn>
+      <q-btn unelevated color="negative" @click="confirmDelete" :loading="deleteDialog.loading">Delete forever</q-btn>
+    </q-card-actions>
+  </q-card>
+</q-dialog>
+
+<!-- Main page -->
 <div class="row q-col-gutter-md">
-  <div class="col-12">
+  <div class="col-12 col-md-8">
     <q-card>
       <q-card-section>
         <div class="row items-center no-wrap">
           <div class="col">
             <div class="text-h5">ContentWall</div>
             <div class="text-subtitle2 text-grey">
-              Create real paywalls with server-hosted articles and images
+              Real paywalls with server-hosted articles, images and bundles
             </div>
           </div>
           <div class="col-auto">
@@ -126,50 +185,64 @@
       <q-separator></q-separator>
 
       <q-card-section>
+        <div class="row q-gutter-sm q-mb-md">
+          <q-toggle v-model="showArchived" label="Show archived" @update:model-value="loadItems"></q-toggle>
+          <q-space></q-space>
+          <q-btn outline color="primary" icon="download" no-caps
+            @click="exportCsv">Export CSV</q-btn>
+        </div>
+
         <q-table :rows="items" :columns="columns" row-key="id" :loading="loading"
-          :pagination="{ rowsPerPage: 10 }" dense flat
-        >
+          :pagination="{ rowsPerPage: 10 }" dense flat>
           <template v-slot:body="props">
-            <q-tr :props="props">
+            <q-tr :props="props" :style="props.row.archived_at ? 'opacity: 0.5' : ''">
               <q-td key="title" :props="props">
                 <strong v-text="props.row.title"></strong>
+                <q-badge v-if="props.row.archived_at" color="grey" class="q-ml-sm">archived</q-badge>
                 <br>
                 <span class="text-caption text-grey" v-text="props.row.description"></span>
               </q-td>
               <q-td key="content_type" :props="props">
-                <q-badge :color="props.row.content_type === 'article' ? 'blue' : 'purple'"
-                  v-text="props.row.content_type"
-                ></q-badge>
+                <q-badge :color="contentTypeColor(props.row.content_type)" v-text="props.row.content_type"></q-badge>
+                <span v-if="props.row.content_type === 'bundle' && props.row.file_count"
+                      class="text-caption q-ml-xs"
+                      v-text="props.row.file_count + ' files'"></span>
               </q-td>
               <q-td key="price" :props="props">
                 <span v-text="props.row.amount + ' ' + props.row.currency"></span>
                 <br>
                 <q-badge v-if="props.row.release_delay_seconds > 0" color="orange" class="q-mt-xs">
-                  +<span v-text="props.row.release_delay_seconds"></span>s delay
+                  +<span v-text="props.row.release_delay_seconds"></span>s
+                </q-badge>
+                <q-badge v-if="props.row.access_duration_seconds > 0" color="deep-orange" class="q-mt-xs">
+                  ⏳<span v-text="formatDuration(props.row.access_duration_seconds)"></span>
                 </q-badge>
               </q-td>
+              <q-td key="payments" :props="props">
+                <div class="text-bold" v-text="props.row.payment_count"></div>
+                <div class="text-caption text-grey" v-text="props.row.total_sats + ' sats'"></div>
+              </q-td>
               <q-td key="status" :props="props">
-                <q-icon :name="props.row.has_content ? 'check_circle' : 'warning'"
-                  :color="props.row.has_content ? 'positive' : 'warning'" size="sm"
-                ></q-icon>
-                <q-badge v-if="props.row.scheduled_at" color="info" class="q-ml-sm">Scheduled</q-badge>
-                <q-badge v-if="props.row.onion_hostname" color="deep-purple" class="q-ml-sm">Tor</q-badge>
+                <q-badge v-if="props.row.scheduled_at" color="info" class="q-mr-xs">Scheduled</q-badge>
+                <q-badge v-if="props.row.onion_hostname" color="deep-purple" class="q-mr-xs">Tor</q-badge>
+                <q-badge v-if="props.row.webhook_url" color="cyan" class="q-mr-xs">Webhook</q-badge>
               </q-td>
               <q-td key="actions" :props="props">
-                <div class="row q-gutter-xs">
+                <div class="row q-gutter-xs no-wrap">
                   <q-btn flat round color="primary" icon="content_copy" size="sm" @click="copyLink(props.row)">
                     <q-tooltip>Copy link</q-tooltip>
                   </q-btn>
-                  <q-btn v-if="props.row.onion_hostname" flat round color="deep-purple" icon="security" size="sm"
-                    @click="copyOnionLink(props.row)">
-                    <q-tooltip>Copy onion link</q-tooltip>
-                  </q-btn>
-                  <q-btn flat round color="info" icon="open_in_new" size="sm"
-                    @click="openPublicPage(props.row.id)">
+                  <q-btn flat round color="info" icon="open_in_new" size="sm" @click="openPublicPage(props.row.id)">
                     <q-tooltip>View public page</q-tooltip>
                   </q-btn>
+                  <q-btn flat round color="orange" icon="bar_chart" size="sm" @click="openStats(props.row)">
+                    <q-tooltip>Stats</q-tooltip>
+                  </q-btn>
+                  <q-btn flat round color="secondary" icon="edit" size="sm" @click="openEditDialog(props.row)">
+                    <q-tooltip>Edit</q-tooltip>
+                  </q-btn>
                   <q-btn flat round color="negative" icon="delete" size="sm" @click="openDeleteDialog(props.row)">
-                    <q-tooltip>Delete</q-tooltip>
+                    <q-tooltip>Delete or archive</q-tooltip>
                   </q-btn>
                 </div>
               </q-td>
@@ -182,6 +255,35 @@
             </div>
           </template>
         </q-table>
+      </q-card-section>
+    </q-card>
+  </div>
+
+  <!-- Sidebar: aggregate stats + chart -->
+  <div class="col-12 col-md-4">
+    <q-card class="q-mb-md">
+      <q-card-section>
+        <div class="text-subtitle2 text-grey">All-time totals</div>
+        <div class="row q-col-gutter-sm q-mt-sm">
+          <div class="col-6">
+            <div class="text-h5" v-text="totalPayments"></div>
+            <div class="text-caption text-grey">payments</div>
+          </div>
+          <div class="col-6">
+            <div class="text-h5" v-text="totalSats + ' sat'"></div>
+            <div class="text-caption text-grey">earned</div>
+          </div>
+        </div>
+      </q-card-section>
+    </q-card>
+
+    <q-card>
+      <q-card-section>
+        <div class="text-subtitle2 text-grey q-mb-sm">Last 30 days</div>
+        <canvas id="cw-chart" height="180"></canvas>
+        <div v-if="!timeseries.length" class="text-center text-caption text-grey q-pa-md">
+          No payments yet
+        </div>
       </q-card-section>
     </q-card>
   </div>

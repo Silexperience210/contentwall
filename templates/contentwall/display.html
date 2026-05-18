@@ -1,112 +1,252 @@
 {% extends "public.html" %}
 
+{% block styles %}
+<style>
+  :root {
+    --cw-orange: #ff6b00;
+    --cw-red:    #ff2a45;
+    --cw-glow:   0 0 24px rgba(255, 107, 0, 0.35);
+    --cw-glow-strong: 0 0 36px rgba(255, 107, 0, 0.55);
+  }
+  body { background: radial-gradient(ellipse at top, #1a1320 0%, #0a0814 70%); }
+  .cw-card {
+    background: linear-gradient(160deg, rgba(40,20,30,0.85), rgba(15,10,20,0.95));
+    border: 1px solid rgba(255, 107, 0, 0.25);
+    box-shadow: var(--cw-glow);
+    color: #f5f1e8;
+  }
+  .cw-card .text-grey,
+  .cw-card .text-caption { color: #b9aeb6 !important; }
+  .cw-title { font-family: monospace; letter-spacing: 0.04em; }
+  .cw-amount {
+    font-family: monospace;
+    color: var(--cw-orange);
+    text-shadow: 0 0 8px rgba(255,107,0,0.6);
+  }
+  .cw-cta {
+    background: linear-gradient(135deg, var(--cw-orange), var(--cw-red)) !important;
+    color: #1a0a00 !important;
+    font-weight: 700;
+    box-shadow: var(--cw-glow);
+  }
+  .cw-cta:hover { box-shadow: var(--cw-glow-strong); }
+  .cw-teaser-article {
+    position: relative;
+    max-height: 200px;
+    overflow: hidden;
+    padding: 14px;
+    background: rgba(255,107,0,0.04);
+    border-left: 3px solid var(--cw-orange);
+    white-space: pre-wrap;
+  }
+  .cw-teaser-article.blurred { filter: blur(4px); user-select: none; }
+  .cw-teaser-article::after {
+    content: "";
+    position: absolute;
+    inset: auto 0 0 0;
+    height: 60%;
+    background: linear-gradient(to bottom, transparent, rgba(15,10,20,0.97));
+    pointer-events: none;
+  }
+  .cw-teaser-image {
+    max-width: 100%;
+    border-radius: 8px;
+    border: 1px solid rgba(255,107,0,0.25);
+  }
+  .cw-mono { font-family: monospace; word-break: break-all; }
+  .cw-bullet {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--cw-orange); display: inline-block;
+    box-shadow: 0 0 6px var(--cw-orange);
+    margin-right: 8px;
+  }
+  .cw-pulse {
+    animation: cw-pulse 1.4s ease-in-out infinite;
+  }
+  @keyframes cw-pulse {
+    0%, 100% { opacity: 0.55; }
+    50%       { opacity: 1; }
+  }
+</style>
+{% endblock %}
+
 {% block page %}
-<div class="row q-col-gutter-md justify-center">
-  <div class="col-12 col-sm-8 col-md-6 col-lg-5">
-    <q-card class="q-pa-lg q-mb-md bg-info" v-if="isScheduledPending">
-      <q-card-section class="text-center text-white">
-        <q-icon name="schedule" size="48px" class="q-mb-md"></q-icon>
-        <h5 class="text-h5 q-mt-none q-mb-sm">Coming Soon</h5>
-        <p>This content will be available on <strong v-text="scheduledDateFormatted"></strong></p>
-        <q-linear-progress indeterminate color="white" class="q-mt-md"></q-linear-progress>
+<div class="row q-col-gutter-md justify-center q-pa-md">
+  <div class="col-12 col-sm-9 col-md-7 col-lg-5">
+
+    <!-- Scheduled (not yet released) -->
+    <q-card class="cw-card q-pa-lg q-mb-md" v-if="isScheduledPending">
+      <q-card-section class="text-center">
+        <q-icon name="schedule" size="48px" style="color: var(--cw-orange);" class="q-mb-md"></q-icon>
+        <h5 class="text-h5 cw-title q-mt-none q-mb-sm">// COMING SOON</h5>
+        <p>Drops on <strong class="cw-amount" v-text="scheduledDateFormatted"></strong></p>
+        <q-linear-progress indeterminate color="orange" class="q-mt-md"></q-linear-progress>
       </q-card-section>
     </q-card>
 
-    <q-card class="q-pa-lg" v-if="!paid">
-      <q-card-section class="text-center">
-        <q-icon name="lock" size="48px" color="primary" class="q-mb-md"></q-icon>
-        <h5 class="text-h5 q-mt-none q-mb-sm" v-text="paywallTitle"></h5>
-        <p class="text-body2 text-grey q-mb-lg" v-show="paywallDescription" v-text="paywallDescription"></p>
+    <!-- Paywall view -->
+    <q-card class="cw-card q-pa-lg" v-if="!paid">
+      <q-card-section>
+        <div class="row items-center q-mb-md">
+          <q-icon name="lock" size="32px" style="color: var(--cw-orange);" class="q-mr-sm"></q-icon>
+          <div>
+            <div class="text-h5 cw-title" v-text="paywallTitle"></div>
+            <div class="text-caption" v-show="paywallDescription" v-text="paywallDescription"></div>
+          </div>
+        </div>
 
-        <q-separator class="q-my-md"></q-separator>
+        <!-- Teaser -->
+        <div v-if="preview" class="q-mt-md q-mb-md">
+          <div class="text-caption q-mb-xs">
+            <span class="cw-bullet"></span>PREVIEW
+          </div>
+          <div v-if="preview.content_type === 'article'"
+               :class="['cw-teaser-article', preview.teaser_blur ? 'blurred' : '']"
+               v-text="preview.teaser_text"></div>
+          <div v-else-if="preview.content_type === 'image' && preview.preview_data" class="text-center">
+            <img :src="preview.preview_data" class="cw-teaser-image" />
+          </div>
+          <div v-else-if="preview.content_type === 'bundle'" class="cw-teaser-article">
+            <div class="text-caption q-mb-sm">Bundle contains <span class="cw-amount" v-text="preview.files.length"></span> file(s):</div>
+            <ul style="padding-left: 20px; margin: 0;">
+              <li v-for="f in preview.files" class="cw-mono">
+                <span v-text="f.filename"></span> — <span v-text="(f.size / 1024).toFixed(1) + ' KB'"></span>
+              </li>
+            </ul>
+          </div>
+        </div>
 
-        <div class="q-mb-lg">
-          <q-badge color="primary" class="q-mb-sm" v-text="contentType === 'article' ? 'Article' : 'Image'"></q-badge>
-          <div class="text-caption text-grey">This content is hosted securely. Pay to unlock it.</div>
-          <q-badge v-if="releaseDelaySeconds > 0" color="orange" class="q-mt-sm">
-            <q-icon name="timer" size="xs" class="q-mr-xs"></q-icon>
-            Content appears <strong class="q-ml-xs" v-text="releaseDelaySeconds + 's'"></strong> after payment
+        <!-- Badges row -->
+        <div class="row q-gutter-xs q-my-md">
+          <q-badge outline color="orange" v-text="contentType.toUpperCase()"></q-badge>
+          <q-badge outline color="orange" v-if="releaseDelaySeconds > 0">
+            ⏱ +<span v-text="releaseDelaySeconds"></span>s after pay
+          </q-badge>
+          <q-badge outline color="orange" v-if="accessDurationSeconds > 0">
+            ⏳ <span v-text="formattedDuration"></span> rental
+          </q-badge>
+          <q-badge outline color="orange" v-if="maxViews > 0">
+            👁 <span v-text="maxViews"></span> views max
           </q-badge>
         </div>
 
-        <q-form class="q-gutter-md">
-          <q-input filled v-model.number="userAmount" type="number" :min="paywallAmount"
-            :suffix="paywallCurrency" label="Amount *"
-            :hint="'Minimum ' + formattedAmount" class="q-mx-auto" style="max-width: 300px;"
+        <!-- Amount + CTA -->
+        <q-form class="q-gutter-md q-mt-md">
+          <div class="text-center">
+            <div class="text-caption">PRICE</div>
+            <div class="text-h3 cw-amount">
+              <span v-text="paywallAmount"></span>
+              <span class="text-h5" v-text="' ' + paywallCurrency"></span>
+            </div>
+          </div>
+
+          <q-input filled dark dense v-model.number="userAmount" type="number"
+            :min="paywallAmount" :suffix="paywallCurrency"
+            label="Custom amount (≥ minimum)"
+            :hint="'Tip the creator if you want — minimum is ' + paywallAmount + ' ' + paywallCurrency"
+            class="q-mx-auto" style="max-width: 320px;"
           ></q-input>
 
-          <q-btn unelevated color="primary"
+          <q-btn class="cw-cta full-width q-mt-md" size="lg" no-caps unelevated
             :disable="userAmount < paywallAmount || paymentReq || loading || isScheduledPending"
-            @click="createInvoice()" :loading="loading" size="lg" class="q-mt-md full-width"
+            @click="createInvoice()" :loading="loading"
           >
             <q-icon name="bolt" class="q-mr-sm"></q-icon>
-            <span v-if="isScheduledPending">Not Yet Available</span>
-            <span v-else>Pay to Unlock</span>
+            <span v-if="isScheduledPending">// NOT YET AVAILABLE</span>
+            <span v-else>// PAY TO UNLOCK</span>
           </q-btn>
+
+          <div class="text-caption text-center q-mt-sm" v-if="lnurl">
+            <q-btn flat dense size="sm" style="color: var(--cw-orange);"
+              @click="copyLnurl" icon="qr_code_2">
+              Copy LNURL (any Lightning wallet)
+            </q-btn>
+          </div>
         </q-form>
 
+        <!-- Invoice -->
         <div v-if="paymentReq" class="q-mt-lg">
-          <q-separator class="q-my-md"></q-separator>
-          <div class="text-subtitle2 q-mb-sm">Scan with Lightning wallet</div>
-          <lnbits-qrcode :value="paymentReq" :href="paymentReq" style="max-width: 250px; margin: 0 auto;"
-          ></lnbits-qrcode>
-          <div class="row q-mt-md justify-center q-gutter-sm">
-            <q-btn outline color="grey" @click="copyInvoice" icon="content_copy">Copy Invoice</q-btn>
-            <q-btn flat color="grey" @click="cancelPayment">Cancel</q-btn>
+          <q-separator dark class="q-my-md" style="background: rgba(255,107,0,0.3);"></q-separator>
+          <div class="text-subtitle2 q-mb-sm text-center">
+            <span class="cw-bullet"></span>SCAN WITH LIGHTNING WALLET
           </div>
-          <div class="text-caption text-grey q-mt-sm">
-            Waiting for payment... <q-spinner size="1em"></q-spinner>
+          <div style="max-width: 260px; margin: 0 auto; padding: 8px;
+                      background: #fff; border-radius: 8px;
+                      box-shadow: var(--cw-glow);">
+            <lnbits-qrcode :value="paymentReq" :href="paymentReq"></lnbits-qrcode>
+          </div>
+          <div class="row q-mt-md justify-center q-gutter-sm">
+            <q-btn outline color="orange" @click="copyInvoice" icon="content_copy" no-caps>Copy invoice</q-btn>
+            <q-btn flat color="grey" @click="cancelPayment" no-caps>Cancel</q-btn>
+          </div>
+          <div class="text-caption text-center q-mt-sm cw-pulse">
+            ▸ Waiting for payment <q-spinner-dots color="orange" size="1.2em"></q-spinner-dots>
           </div>
         </div>
       </q-card-section>
     </q-card>
 
-    <q-card class="q-pa-lg text-center" v-if="paid && contentUnlocked">
-      <q-card-section class="text-center">
+    <!-- Unlocked -->
+    <q-card class="cw-card q-pa-lg text-center" v-if="paid && contentUnlocked && !expired">
+      <q-card-section>
         <q-icon name="check_circle" size="64px" color="positive" class="q-mb-md"></q-icon>
-        <h5 class="text-h5 q-mt-none q-mb-sm">Payment Successful!</h5>
-        <p class="text-body2 q-mb-lg">Your content is now unlocked.</p>
+        <h5 class="text-h5 cw-title q-mt-none q-mb-sm">// PAYMENT CONFIRMED</h5>
+        <p class="text-body2 q-mb-lg">Your content is unlocked.</p>
 
-        <q-btn unelevated color="primary" :href="contentUrl" size="lg" class="q-mb-md full-width">
+        <q-btn class="cw-cta full-width q-mb-md" :href="contentUrl" size="lg" no-caps>
           <q-icon name="visibility" class="q-mr-sm"></q-icon>
-          View Content
+          // VIEW CONTENT
         </q-btn>
 
-        <q-btn v-if="onionUrl" outline color="deep-purple" :href="onionUrl" size="md" class="full-width"
-          icon="security"
+        <q-btn v-if="onionUrl" outline color="deep-purple" :href="onionUrl"
+          size="md" class="full-width" icon="security" no-caps
         >View via Tor</q-btn>
 
-        <div class="text-caption text-grey q-mt-sm">
-          <span v-if="remembers">This link remembers your payment. Bookmark it for later access.</span>
-          <span v-else>Keep this link safe.</span>
+        <div class="text-caption q-mt-md">
+          <div v-if="expiresAt">Access expires: <span class="cw-mono" v-text="expiresAtFormatted"></span></div>
+          <div v-if="maxViews > 0">Views remaining: <span class="cw-amount" v-text="(maxViews - viewsCount)"></span> / <span v-text="maxViews"></span></div>
+          <div v-if="remembers && !expiresAt">This link remembers your payment. Bookmark it.</div>
+          <div v-else-if="!remembers">Keep this link safe.</div>
         </div>
       </q-card-section>
     </q-card>
 
-    <q-card class="q-pa-lg text-center" v-if="paid && !contentUnlocked">
-      <q-card-section class="text-center">
-        <q-icon name="timer" size="64px" color="orange" class="q-mb-md"></q-icon>
-        <h5 class="text-h5 q-mt-none q-mb-sm">Payment Received!</h5>
-        <p class="text-body2 q-mb-lg">Content will appear in...</p>
+    <!-- Expired -->
+    <q-card class="cw-card q-pa-lg text-center" v-if="expired">
+      <q-card-section>
+        <q-icon name="lock_clock" size="64px" color="negative" class="q-mb-md"></q-icon>
+        <h5 class="text-h5 cw-title q-mt-none q-mb-sm">// ACCESS EXPIRED</h5>
+        <p>Your rental window has ended. Buy again to regain access.</p>
+        <q-btn class="cw-cta q-mt-md" @click="window.location.reload()" no-caps>// REFRESH</q-btn>
+      </q-card-section>
+    </q-card>
 
-        <div class="text-h2 text-orange q-mb-lg" v-text="Math.ceil(unlockInSeconds) + 's'"></div>
+    <!-- Countdown delay -->
+    <q-card class="cw-card q-pa-lg text-center" v-if="paid && !contentUnlocked && !expired">
+      <q-card-section>
+        <q-icon name="timer" size="64px" style="color: var(--cw-orange);" class="q-mb-md"></q-icon>
+        <h5 class="text-h5 cw-title q-mt-none q-mb-sm">// PAYMENT RECEIVED</h5>
+        <p class="text-body2 q-mb-lg">Releasing in...</p>
 
-        <q-linear-progress :value="delayProgress" color="orange" size="20px" class="q-mb-md">
+        <div class="text-h2 cw-amount q-mb-lg" v-text="Math.ceil(unlockInSeconds) + 's'"></div>
+
+        <q-linear-progress :value="delayProgress" color="orange" size="20px" class="q-mb-md"
+          style="border-radius: 4px;"
+        >
           <div class="absolute-full flex flex-center">
-            <q-badge color="transparent" text-color="white" v-text="Math.round(delayProgress * 100) + '%'"></q-badge>
+            <q-badge color="transparent" text-color="white"
+              v-text="Math.round(delayProgress * 100) + '%'"></q-badge>
           </div>
         </q-linear-progress>
 
-        <q-btn unelevated color="orange" :href="contentUrl" :disable="unlockInSeconds > 0" size="lg" class="full-width">
+        <q-btn class="cw-cta full-width" :href="contentUrl"
+          :disable="unlockInSeconds > 0" size="lg" no-caps>
           <q-icon name="visibility" class="q-mr-sm"></q-icon>
-          View Content
+          // VIEW CONTENT
         </q-btn>
-
-        <div class="text-caption text-grey q-mt-md">
-          The creator set a <span v-text="releaseDelaySeconds"></span> second delay before content appears.
-        </div>
       </q-card-section>
     </q-card>
+
   </div>
 </div>
 {% endblock %}
