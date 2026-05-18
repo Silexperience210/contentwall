@@ -185,7 +185,14 @@ async def store_image_file(item_id: str, upload_file) -> dict:
     _ensure_files_dir()
     file_ext = os.path.splitext(upload_file.filename or "")[1].lower()
     if file_ext not in [".jpg", ".jpeg", ".png", ".gif", ".webp"]:
-        file_ext = ".bin"
+        ct = (upload_file.content_type or "").lower()
+        ext_map = {
+            "image/jpeg": ".jpg",
+            "image/png": ".png",
+            "image/gif": ".gif",
+            "image/webp": ".webp",
+        }
+        file_ext = ext_map.get(ct, ".bin")
     file_path = os.path.join(FILES_DIR, f"{item_id}{file_ext}")
     content = await upload_file.read()
     content_hash = _hash_content(content)
@@ -219,6 +226,9 @@ async def get_image_file_info(item_id: str) -> Optional[dict]:
         fp = os.path.join(FILES_DIR, f"{item_id}{ext}")
         if os.path.exists(fp):
             return {"file_path": fp, "content_type": ct, "size": os.path.getsize(fp)}
+    fp = os.path.join(FILES_DIR, f"{item_id}.bin")
+    if os.path.exists(fp):
+        return {"file_path": fp, "content_type": "application/octet-stream", "size": os.path.getsize(fp)}
     return None
 
 
@@ -558,7 +568,20 @@ async def store_media_file(item_id: str, upload_file) -> dict:
     # Tolerate a broad set; the content_type is what we serve back.
     if file_ext not in (".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav",
                         ".mp4", ".webm", ".mkv", ".mov"):
-        file_ext = ".bin"
+        ct = (upload_file.content_type or "").lower()
+        ext_map = {
+            "audio/mpeg": ".mp3",
+            "audio/mp4": ".m4a",
+            "audio/aac": ".aac",
+            "audio/ogg": ".ogg",
+            "audio/opus": ".opus",
+            "audio/wav": ".wav",
+            "video/mp4": ".mp4",
+            "video/webm": ".webm",
+            "video/x-matroska": ".mkv",
+            "video/quicktime": ".mov",
+        }
+        file_ext = ext_map.get(ct, ".bin")
     file_path = os.path.join(FILES_DIR, f"{item_id}{file_ext}")
 
     content = await upload_file.read()
@@ -591,6 +614,9 @@ async def get_media_file_info(item_id: str) -> Optional[dict]:
         fp = os.path.join(FILES_DIR, f"{item_id}{ext}")
         if os.path.exists(fp):
             return {"file_path": fp, "content_type": ct, "size": os.path.getsize(fp)}
+    fp = os.path.join(FILES_DIR, f"{item_id}.bin")
+    if os.path.exists(fp):
+        return {"file_path": fp, "content_type": "application/octet-stream", "size": os.path.getsize(fp)}
     return None
 
 

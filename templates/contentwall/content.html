@@ -118,18 +118,26 @@
 
         {% elif content_type == 'image' %}
         <div class="image-content text-center">
+          {% if image_data %}
           <img src="{{ image_data }}" alt="{{ title }}" />
+          {% else %}
+          <p class="text-negative">Image unavailable</p>
+          {% endif %}
         </div>
 
         {% elif content_type == 'audio' %}
         <audio controls preload="metadata" class="cw-media" style="height: 56px;">
+          {% if media_url %}
           <source src="{{ media_url }}" type="{{ media_mime }}">
+          {% endif %}
           Your browser does not support audio playback.
         </audio>
 
         {% elif content_type == 'video' %}
         <video controls preload="metadata" class="cw-media" playsinline>
+          {% if media_url %}
           <source src="{{ media_url }}" type="{{ media_mime }}">
+          {% endif %}
           Your browser does not support video playback.
         </video>
 
