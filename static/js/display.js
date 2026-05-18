@@ -181,17 +181,34 @@ window.app = Vue.createApp({
     },
 
     listenForPayment() {
-      const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${wsProtocol}//${window.location.host}/contentwall/api/v1/items/ws/${this.itemId}/${this.paymentHash}`;
-      this.ws = new WebSocket(wsUrl);
+      // v1.2.1: start polling immediately AND open a WebSocket in parallel.
+      // The WS used to be the primary channel with polling only as an
+      // onerror fallback — that left the user stuck whenever the WS closed
+      // cleanly (proxy timeout, mobile sleep) without firing onerror.
+      // Polling alone is enough; the WS just makes confirmation snappier.
+      this.pollInterval = setInterval(() => this.checkPayment(), 3000);
+      // Fire one immediate poll so payments made within the first 3s
+      // (e.g. a wallet that auto-pays) get caught without waiting.
+      this.checkPayment();
 
-      this.ws.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        if (data.paid) this.onPaymentSuccess();
-      };
-      this.ws.onerror = () => {
-        this.pollInterval = setInterval(() => this.checkPayment(), 4000);
-      };
+      try {
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${wsProtocol}//${window.location.host}/contentwall/api/v1/items/ws/${this.itemId}/${this.paymentHash}`;
+        this.ws = new WebSocket(wsUrl);
+
+        this.ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.paid) this.onPaymentSuccess();
+          } catch (_) { /* malformed frame: polling will handle it */ }
+        };
+        // onerror and onclose are both no-ops here: polling is already
+        // running independently and will detect the payment regardless.
+        this.ws.onerror = () => { /* polling handles this */ };
+        this.ws.onclose = () => { this.ws = null; };
+      } catch (_) {
+        // Browser blocked WS (rare); polling above is enough.
+      }
     },
 
     recordPurchaseLocally() {

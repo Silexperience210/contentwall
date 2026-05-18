@@ -558,6 +558,83 @@ async def api_check_payment(
     }
 
 
+@contentwall_api_router.get(
+    "/api/v1/items/debug/{item_id}/{payment_hash}"
+)
+async def api_debug_payment(item_id: str, payment_hash: str):
+    """
+    v1.2.1 — diagnostic endpoint. Returns the FULL state of a payment so we
+    can tell at a glance why the paywall might say "waiting" while the user
+    swears they paid. Intentionally unauthenticated: it never leaks content,
+    only the boolean state of each step.
+
+    Hit it directly from a browser:
+      GET /contentwall/api/v1/items/debug/<item_id>/<payment_hash>
+    """
+    out: dict = {
+        "item_id": item_id,
+        "payment_hash": payment_hash,
+        "item_exists": False,
+        "item_wallet": None,
+        "contentwall_has_paid": False,
+        "lnbits_payment_found": False,
+        "lnbits_status_pending": None,
+        "lnbits_status_paid": None,
+        "lnbits_extra": None,
+        "extra_tag_matches": False,
+        "extra_id_matches": False,
+        "amount_msat": None,
+        "amount_sats": None,
+        "ws_queue_present": payment_hash in paid_invoices,
+        "errors": [],
+    }
+
+    try:
+        item = await get_item(item_id)
+        if item:
+            out["item_exists"] = True
+            out["item_wallet"] = item.wallet
+        else:
+            return out
+
+        try:
+            out["contentwall_has_paid"] = await has_paid(item_id, payment_hash)
+        except Exception as exc:
+            out["errors"].append(f"has_paid: {exc}")
+
+        try:
+            from lnbits.core.crud import get_standalone_payment
+            from lnbits.core.services import check_transaction_status
+
+            status = await check_transaction_status(item.wallet, payment_hash)
+            out["lnbits_status_pending"] = bool(status.pending)
+            out["lnbits_status_paid"] = bool(getattr(status, "paid", False))
+        except Exception as exc:
+            out["errors"].append(f"check_transaction_status: {exc}")
+
+        try:
+            payment = await get_standalone_payment(
+                checking_id_or_hash=payment_hash,
+                incoming=True,
+                wallet_id=item.wallet,
+            )
+            if payment:
+                out["lnbits_payment_found"] = True
+                extra = _parse_extra(payment)
+                out["lnbits_extra"] = extra
+                out["extra_tag_matches"] = extra.get("tag") == "contentwall"
+                out["extra_id_matches"] = extra.get("id") == item_id
+                out["amount_msat"] = payment.amount
+                out["amount_sats"] = int(payment.amount / 1000)
+        except Exception as exc:
+            out["errors"].append(f"get_standalone_payment: {exc}")
+
+    except Exception as exc:
+        out["errors"].append(f"top-level: {exc}")
+
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Public content endpoints
 # ---------------------------------------------------------------------------

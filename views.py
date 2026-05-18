@@ -147,7 +147,9 @@ async def view_content(
             status = await check_transaction_status(item.wallet, payment_hash)
             if not status.pending:
                 payment = await get_standalone_payment(
-                    checking_id_or_hash=payment_hash, incoming=True
+                    checking_id_or_hash=payment_hash,
+                    incoming=True,
+                    wallet_id=item.wallet,
                 )
                 if (
                     payment
