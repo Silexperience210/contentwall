@@ -228,7 +228,12 @@ async def get_image_file_info(item_id: str) -> Optional[dict]:
             return {"file_path": fp, "content_type": ct, "size": os.path.getsize(fp)}
     fp = os.path.join(FILES_DIR, f"{item_id}.bin")
     if os.path.exists(fp):
-        return {"file_path": fp, "content_type": "application/octet-stream", "size": os.path.getsize(fp)}
+        row = await db.fetchone(
+            "SELECT content_type FROM contentwall.items WHERE id = :id",
+            {"id": item_id},
+        )
+        ct = row["content_type"] if row else "application/octet-stream"
+        return {"file_path": fp, "content_type": ct, "size": os.path.getsize(fp)}
     return None
 
 
@@ -616,7 +621,12 @@ async def get_media_file_info(item_id: str) -> Optional[dict]:
             return {"file_path": fp, "content_type": ct, "size": os.path.getsize(fp)}
     fp = os.path.join(FILES_DIR, f"{item_id}.bin")
     if os.path.exists(fp):
-        return {"file_path": fp, "content_type": "application/octet-stream", "size": os.path.getsize(fp)}
+        row = await db.fetchone(
+            "SELECT content_type FROM contentwall.items WHERE id = :id",
+            {"id": item_id},
+        )
+        ct = row["content_type"] if row else "application/octet-stream"
+        return {"file_path": fp, "content_type": ct, "size": os.path.getsize(fp)}
     return None
 
 
