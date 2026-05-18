@@ -176,13 +176,32 @@ async def archive_item(item_id: str) -> None:
 
 async def delete_item(item_id: str) -> None:
     """Hard delete: wipes payments, files on disk and DB rows."""
-    for ext in [".article", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bin"]:
+    logger.info(f"[delete_item] starting hard delete of item_id={item_id}")
+
+    # Every extension we might have stored content under (image + audio + video
+    # + article + tmp uploads). Missing one of these used to leave orphaned
+    # files on disk and could confuse later uploads with the same item_id.
+    all_extensions = [
+        ".article",
+        # images
+        ".jpg", ".jpeg", ".png", ".gif", ".webp",
+        # audio
+        ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav",
+        # video
+        ".mp4", ".webm", ".mkv", ".mov",
+        # fallback + tmp from interrupted streaming uploads
+        ".bin", ".upload",
+    ]
+    removed = 0
+    for ext in all_extensions:
         fp = os.path.join(FILES_DIR, f"{item_id}{ext}")
         if os.path.exists(fp):
             try:
                 os.remove(fp)
-            except OSError:
-                pass
+                removed += 1
+            except OSError as exc:
+                logger.warning(f"[delete_item] could not remove {fp}: {exc}")
+    logger.info(f"[delete_item] removed {removed} on-disk file(s) for {item_id}")
 
     # Bundle files
     files = await get_item_files(item_id)
@@ -200,15 +219,33 @@ async def delete_item(item_id: str) -> None:
         except OSError:
             pass
 
+    # Delete dependent DB rows. There are no FK CASCADEs in the schema, so the
+    # order matters: child tables before items. Coupons and tips were added
+    # later (m002 / m003) and the previous delete_item forgot about them,
+    # which is what made some deletes silently leave dangling rows.
     await db.execute(
         "DELETE FROM contentwall.item_files WHERE item_id = :id", {"id": item_id}
     )
     await db.execute(
         "DELETE FROM contentwall.payments WHERE item_id = :id", {"id": item_id}
     )
+    # New tables — guarded with try/except so an older install where the
+    # migrations haven't run yet still gets the items row removed.
+    for tbl in ("coupons", "tips"):
+        try:
+            await db.execute(
+                f"DELETE FROM contentwall.{tbl} WHERE item_id = :id",
+                {"id": item_id},
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[delete_item] could not clean {tbl} for {item_id}: {exc}"
+            )
+
     await db.execute(
         "DELETE FROM contentwall.items WHERE id = :id", {"id": item_id}
     )
+    logger.info(f"[delete_item] item_id={item_id} fully deleted")
 
 
 # ---------------------------------------------------------------------------
@@ -672,17 +709,20 @@ async def store_media_file(item_id: str, upload_file) -> dict:
     """
     Store an audio/video file. Like store_image_file, the client-provided
     content_type is not trusted — Android often sends application/octet-stream
-    or video/* for valid MP4/WebM. We validate by magic bytes first, then fall
-    back to the filename extension. The extension on disk always matches the
-    detected MIME so the extension-based lookup in get_media_file_info works.
+    or video/* for valid MP4/WebM. We validate by magic bytes on the first
+    chunk, then stream the rest to disk in 1MB chunks so multi-hundred-MB
+    videos don't OOM the host (important on a Pi 4 running other Umbrel
+    services in parallel). The write is atomic (tmp + rename) so a dropped
+    connection never leaves a half-written file behind.
     """
     _ensure_files_dir()
 
-    content = await upload_file.read()
-    if not content:
+    # Pull the first chunk to identify the file type from its magic bytes
+    first_chunk = await upload_file.read(65536)  # 64 KB
+    if not first_chunk:
         raise ValueError("Uploaded file is empty")
 
-    real_mime = guess_mime_from_bytes(content[:32])
+    real_mime = guess_mime_from_bytes(first_chunk[:32])
     mime_to_ext = {
         "audio/mpeg": ".mp3",
         "audio/mp4": ".m4a",
@@ -727,10 +767,11 @@ async def store_media_file(item_id: str, upload_file) -> dict:
             )
 
     file_path = os.path.join(FILES_DIR, f"{item_id}{file_ext}")
+    tmp_path = file_path + ".upload"
     logger.info(
         f"[store_media_file] item_id={item_id} ext={file_ext} "
         f"mime={effective_mime} client_mime={upload_file.content_type!r} "
-        f"path={file_path}"
+        f"tmp_path={tmp_path}"
     )
 
     # Clean up any stale file from a previous upload under a different ext
@@ -750,10 +791,37 @@ async def store_media_file(item_id: str, upload_file) -> dict:
         except OSError:
             pass
 
-    content_hash = _hash_content(content)
-    with open(file_path, "wb") as f:
-        f.write(content)
-    logger.info(f"[store_media_file] written {len(content)} bytes to {file_path}")
+    # Stream rest of upload to a tmp file, atomic rename on success
+    hasher = hashlib.sha256()
+    hasher.update(first_chunk)
+    total = len(first_chunk)
+    CHUNK = 1024 * 1024  # 1 MB
+    try:
+        with open(tmp_path, "wb") as f:
+            f.write(first_chunk)
+            while True:
+                chunk = await upload_file.read(CHUNK)
+                if not chunk:
+                    break
+                f.write(chunk)
+                hasher.update(chunk)
+                total += len(chunk)
+        if total <= 0:
+            raise ValueError("Uploaded file is empty")
+        os.replace(tmp_path, file_path)
+    except Exception:
+        # Clean up partial write — never leave a half-baked file on disk
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise
+
+    content_hash = hasher.hexdigest()
+    logger.info(
+        f"[store_media_file] written {total} bytes to {file_path}"
+    )
 
     await db.execute(
         "UPDATE contentwall.items SET content_hash = :hash WHERE id = :id",
@@ -762,7 +830,7 @@ async def store_media_file(item_id: str, upload_file) -> dict:
     return {
         "file_path": file_path,
         "content_hash": content_hash,
-        "size": len(content),
+        "size": total,
         "content_type": effective_mime,
     }
 

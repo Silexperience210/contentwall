@@ -205,12 +205,25 @@ async def api_item_archive(
 async def api_item_delete(
     item_id: str, wallet: WalletTypeInfo = Depends(require_admin_key)
 ):
+    logger.info(f"[api_item_delete] DELETE request for item_id={item_id} from wallet={wallet.wallet.id}")
     item = await get_item(item_id)
     if not item:
+        logger.warning(f"[api_item_delete] item not found: {item_id}")
         raise HTTPException(HTTPStatus.NOT_FOUND, "Item not found")
     if item.wallet != wallet.wallet.id:
+        logger.warning(
+            f"[api_item_delete] wallet mismatch for {item_id}: "
+            f"item.wallet={item.wallet} caller={wallet.wallet.id}"
+        )
         raise HTTPException(HTTPStatus.FORBIDDEN, "Not your item")
-    await delete_item(item_id)
+    try:
+        await delete_item(item_id)
+    except Exception as exc:
+        logger.exception(f"[api_item_delete] delete failed for {item_id}: {exc}")
+        raise HTTPException(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            f"Delete failed: {exc}",
+        )
     return {"deleted": True}
 
 

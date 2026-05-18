@@ -45,7 +45,13 @@ window.app = Vue.createApp({
         { name: 'status',       label: 'Flags',     align: 'center'        },
         { name: 'actions',      label: 'Actions',   align: 'right'         },
       ],
-      itemDialog: { show: false, loading: false, data: blankFormData() },
+      itemDialog: {
+        show: false,
+        loading: false,
+        data: blankFormData(),
+        uploadProgress: 0,    // 0-100, set during media/image/bundle upload
+        uploadLabel: '',      // 'Uploading video...' or similar
+      },
       deleteDialog: { show: false, loading: false, item: {} },
       statsDialog: { show: false, title: '', data: { payment_count: 0, total_sats: 0, unique_payers: 0 } },
       couponDialog: {
@@ -175,7 +181,10 @@ window.app = Vue.createApp({
     },
 
     openCreateDialog() {
-      this.itemDialog = { show: true, loading: false, data: blankFormData() };
+      this.itemDialog = {
+        show: true, loading: false, data: blankFormData(),
+        uploadProgress: 0, uploadLabel: '',
+      };
     },
 
     openEditDialog(item) {
@@ -203,6 +212,8 @@ window.app = Vue.createApp({
           markdown: !!item.markdown,
           allow_tips: item.allow_tips === undefined ? true : !!item.allow_tips,
         },
+        uploadProgress: 0,
+        uploadLabel: '',
       };
     },
 
@@ -218,8 +229,50 @@ window.app = Vue.createApp({
       this.itemDialog.data.bundle_files = Array.from(files || []);
     },
 
+    // XHR-based upload so we get real progress events. `fetch()` has no
+    // progress API, which made big video uploads look 'frozen' for minutes.
+    // 30-min upload timeout is enough for several-hundred-MB files even on
+    // slow mobile connections; the user can always Cancel from the dialog.
+    _uploadWithProgress(url, file, adminkey, onProgress) {
+      return new Promise((resolve, reject) => {
+        const fd = new FormData();
+        fd.append('upload_file', file);
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', url);
+        xhr.setRequestHeader('X-Api-Key', adminkey);
+        xhr.timeout = 30 * 60 * 1000;
+        xhr.upload.addEventListener('progress', (e) => {
+          if (e.lengthComputable && onProgress) {
+            onProgress(Math.round((e.loaded / e.total) * 100));
+          }
+        });
+        xhr.addEventListener('load', () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            try { resolve(JSON.parse(xhr.responseText)); }
+            catch { resolve({}); }
+          } else {
+            let detail = `Upload failed (HTTP ${xhr.status})`;
+            try {
+              const j = JSON.parse(xhr.responseText);
+              if (j && j.detail) detail = j.detail;
+            } catch (_) { /* keep generic */ }
+            reject(new Error(detail));
+          }
+        });
+        xhr.addEventListener('error', () =>
+          reject(new Error('Network error during upload')));
+        xhr.addEventListener('abort', () =>
+          reject(new Error('Upload aborted')));
+        xhr.addEventListener('timeout', () =>
+          reject(new Error('Upload timed out (>30 min)')));
+        xhr.send(fd);
+      });
+    },
+
     async sendItemDialog() {
       this.itemDialog.loading = true;
+      this.itemDialog.uploadProgress = 0;
+      this.itemDialog.uploadLabel = '';
       try {
         const d = this.itemDialog.data;
         const wallet = g.user.wallets[0];
@@ -289,48 +342,43 @@ window.app = Vue.createApp({
 
         // Image upload
         if (d.content_type === 'image' && d.image_file) {
-          const fd = new FormData();
-          fd.append('upload_file', d.image_file);
-          const r = await fetch(`/contentwall/api/v1/items/${itemId}/upload`, {
-            method: 'POST',
-            headers: { 'X-Api-Key': wallet.adminkey },
-            body: fd,
-          });
-          if (!r.ok) {
-            const err = await r.json();
-            throw new Error(err.detail || 'Upload failed');
-          }
+          this.itemDialog.uploadLabel = `Uploading image (${(d.image_file.size / (1024*1024)).toFixed(1)} MB)…`;
+          await this._uploadWithProgress(
+            `/contentwall/api/v1/items/${itemId}/upload`,
+            d.image_file,
+            wallet.adminkey,
+            (pct) => { this.itemDialog.uploadProgress = pct; },
+          );
         }
 
         // Audio / video upload
         if ((d.content_type === 'audio' || d.content_type === 'video') && d.media_file) {
-          const fd = new FormData();
-          fd.append('upload_file', d.media_file);
-          const r = await fetch(`/contentwall/api/v1/items/${itemId}/upload-media`, {
-            method: 'POST',
-            headers: { 'X-Api-Key': wallet.adminkey },
-            body: fd,
-          });
-          if (!r.ok) {
-            const err = await r.json();
-            throw new Error(err.detail || 'Media upload failed');
-          }
+          const label = d.content_type === 'video' ? 'video' : 'audio';
+          this.itemDialog.uploadLabel = `Uploading ${label} (${(d.media_file.size / (1024*1024)).toFixed(1)} MB)…`;
+          this.itemDialog.uploadProgress = 0;
+          await this._uploadWithProgress(
+            `/contentwall/api/v1/items/${itemId}/upload-media`,
+            d.media_file,
+            wallet.adminkey,
+            (pct) => { this.itemDialog.uploadProgress = pct; },
+          );
         }
 
         // Bundle uploads
         if (d.content_type === 'bundle' && d.bundle_files && d.bundle_files.length) {
+          let i = 0;
           for (const file of d.bundle_files) {
-            const fd = new FormData();
-            fd.append('upload_file', file);
-            const r = await fetch(`/contentwall/api/v1/items/${itemId}/files`, {
-              method: 'POST',
-              headers: { 'X-Api-Key': wallet.adminkey },
-              body: fd,
-            });
-            if (!r.ok) {
-              const err = await r.json();
-              throw new Error(err.detail || `Upload failed for ${file.name}`);
-            }
+            i += 1;
+            this.itemDialog.uploadLabel =
+              `Uploading file ${i}/${d.bundle_files.length}: ${file.name} ` +
+              `(${(file.size / (1024*1024)).toFixed(1)} MB)…`;
+            this.itemDialog.uploadProgress = 0;
+            await this._uploadWithProgress(
+              `/contentwall/api/v1/items/${itemId}/files`,
+              file,
+              wallet.adminkey,
+              (pct) => { this.itemDialog.uploadProgress = pct; },
+            );
           }
         }
 
@@ -341,6 +389,8 @@ window.app = Vue.createApp({
         LNbits.utils.notifyApiError(err);
       } finally {
         this.itemDialog.loading = false;
+        this.itemDialog.uploadProgress = 0;
+        this.itemDialog.uploadLabel = '';
       }
     },
 

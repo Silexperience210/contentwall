@@ -208,11 +208,28 @@
       <q-input filled dense v-model="itemDialog.data.onion_hostname"
         label=".onion hostname (optional)"></q-input>
 
+      <div v-if="itemDialog.uploadLabel" class="q-mt-md q-pa-sm"
+           style="background: rgba(255,107,0,0.08); border: 1px solid rgba(255,107,0,0.3); border-radius: 6px;">
+        <div class="text-caption q-mb-xs" style="color: #ff6b00;">
+          <q-icon name="cloud_upload" size="xs" class="q-mr-xs"></q-icon>
+          <span v-text="itemDialog.uploadLabel"></span>
+          <span class="q-ml-sm" v-text="itemDialog.uploadProgress + '%'"></span>
+        </div>
+        <q-linear-progress
+          :value="itemDialog.uploadProgress / 100"
+          color="orange"
+          size="14px"
+          style="border-radius: 4px;"
+          :indeterminate="itemDialog.uploadProgress === 0 || itemDialog.uploadProgress >= 100">
+        </q-linear-progress>
+      </div>
+
       <div class="row q-mt-lg">
         <q-btn unelevated color="primary" type="submit"
           :disable="!isFormValid" :loading="itemDialog.loading"
           v-text="itemDialog.data.id ? 'Save changes' : 'Create'"></q-btn>
-        <q-btn v-close-popup flat color="grey" class="q-ml-auto">Cancel</q-btn>
+        <q-btn v-close-popup flat color="grey" class="q-ml-auto"
+          :disable="itemDialog.loading">Cancel</q-btn>
       </div>
     </q-form>
   </q-card>
@@ -334,27 +351,44 @@
                 <q-badge v-if="props.row.webhook_url" color="cyan" class="q-mr-xs">Webhook</q-badge>
               </q-td>
               <q-td key="actions" :props="props">
-                <div class="row q-gutter-xs no-wrap">
+                <div class="row q-gutter-xs no-wrap items-center justify-end">
+                  <!-- Quick actions: copy link only (most common) -->
                   <q-btn flat round color="primary" icon="content_copy" size="sm" @click="copyLink(props.row)">
                     <q-tooltip>Copy link</q-tooltip>
                   </q-btn>
-                  <q-btn flat round color="info" icon="open_in_new" size="sm" @click="openPublicPage(props.row.id)">
-                    <q-tooltip>View public page</q-tooltip>
-                  </q-btn>
-                  <q-btn flat round color="orange" icon="bar_chart" size="sm" @click="openStats(props.row)">
-                    <q-tooltip>Stats</q-tooltip>
-                  </q-btn>
-                  <q-btn flat round color="purple" icon="local_offer" size="sm" @click="openCoupons(props.row)">
-                    <q-tooltip>Coupons</q-tooltip>
-                  </q-btn>
-                  <q-btn flat round color="teal" icon="integration_instructions" size="sm" @click="openEmbed(props.row)">
-                    <q-tooltip>Embed snippet</q-tooltip>
-                  </q-btn>
-                  <q-btn flat round color="secondary" icon="edit" size="sm" @click="openEditDialog(props.row)">
-                    <q-tooltip>Edit</q-tooltip>
-                  </q-btn>
-                  <q-btn flat round color="negative" icon="delete" size="sm" @click="openDeleteDialog(props.row)">
-                    <q-tooltip>Delete or archive</q-tooltip>
+                  <!-- Everything else in a dropdown menu — saves space on mobile
+                       and ensures Delete is always reachable -->
+                  <q-btn flat round color="grey-7" icon="more_vert" size="md">
+                    <q-menu auto-close>
+                      <q-list dense style="min-width: 200px;">
+                        <q-item clickable @click="openPublicPage(props.row.id)">
+                          <q-item-section avatar><q-icon name="open_in_new" color="info"/></q-item-section>
+                          <q-item-section>View public page</q-item-section>
+                        </q-item>
+                        <q-item clickable @click="openStats(props.row)">
+                          <q-item-section avatar><q-icon name="bar_chart" color="orange"/></q-item-section>
+                          <q-item-section>Stats</q-item-section>
+                        </q-item>
+                        <q-item clickable @click="openCoupons(props.row)">
+                          <q-item-section avatar><q-icon name="local_offer" color="purple"/></q-item-section>
+                          <q-item-section>Coupons</q-item-section>
+                        </q-item>
+                        <q-item clickable @click="openEmbed(props.row)">
+                          <q-item-section avatar><q-icon name="integration_instructions" color="teal"/></q-item-section>
+                          <q-item-section>Embed snippet</q-item-section>
+                        </q-item>
+                        <q-item clickable @click="openEditDialog(props.row)">
+                          <q-item-section avatar><q-icon name="edit" color="secondary"/></q-item-section>
+                          <q-item-section>Edit</q-item-section>
+                        </q-item>
+                        <q-separator/>
+                        <q-item clickable @click="openDeleteDialog(props.row)">
+                          <q-item-section avatar><q-icon name="delete" color="negative"/></q-item-section>
+                          <q-item-section>Delete or archive</q-item-section>
+                        </q-item>
+                      </q-list>
+                    </q-menu>
+                    <q-tooltip>More actions</q-tooltip>
                   </q-btn>
                 </div>
               </q-td>
