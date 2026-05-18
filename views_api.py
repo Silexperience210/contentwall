@@ -130,15 +130,15 @@ async def api_create_invoice(
         raise HTTPException(HTTPStatus.BAD_REQUEST, f"Minimum amount is {item.amount} {item.currency}")
 
     try:
-        payment_hash, payment_request = await create_invoice(
+        payment = await create_invoice(
             wallet_id=item.wallet,
             amount=amount,
             memo=item.memo,
             extra={"tag": "contentwall", "id": item_id},
         )
         return {
-            "payment_hash": payment_hash,
-            "payment_request": payment_request,
+            "payment_hash": payment.payment_hash,
+            "payment_request": payment.bolt11,
         }
     except Exception as exc:
         logger.error(f"Error creating invoice for item {item_id}: {exc}")
