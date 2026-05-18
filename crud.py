@@ -61,6 +61,9 @@ def _ensure_files_dir():
     os.makedirs(FILES_DIR, exist_ok=True)
 
 
+from loguru import logger
+
+
 def _hash_content(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
@@ -229,10 +232,12 @@ async def store_image_file(item_id: str, upload_file) -> dict:
         }
         file_ext = ext_map.get(ct, ".bin")
     file_path = os.path.join(FILES_DIR, f"{item_id}{file_ext}")
+    logger.info(f"[store_image_file] item_id={item_id} ext={file_ext} path={file_path}")
     content = await upload_file.read()
     content_hash = _hash_content(content)
     with open(file_path, "wb") as f:
         f.write(content)
+    logger.info(f"[store_image_file] written {len(content)} bytes to {file_path}")
     await db.execute(
         "UPDATE contentwall.items SET content_hash = :hash WHERE id = :id",
         {"hash": content_hash, "id": item_id},
@@ -254,6 +259,7 @@ async def get_article_content(item_id: str) -> Optional[str]:
 
 
 async def get_image_file_info(item_id: str) -> Optional[dict]:
+    logger.info(f"[get_image_file_info] item_id={item_id} FILES_DIR={FILES_DIR}")
     for ext, ct in [
         (".jpg", "image/jpeg"), (".jpeg", "image/jpeg"),
         (".png", "image/png"), (".gif", "image/gif"), (".webp", "image/webp"),
@@ -264,13 +270,16 @@ async def get_image_file_info(item_id: str) -> Optional[dict]:
     fp = os.path.join(FILES_DIR, f"{item_id}.bin")
     if os.path.exists(fp):
         ct = _guess_mime_from_magic(fp)
+        logger.info(f"[get_image_file_info] found .bin fallback: {fp} mime={ct}")
         return {"file_path": fp, "content_type": ct, "size": os.path.getsize(fp)}
+    logger.warning(f"[get_image_file_info] NO file found for item_id={item_id} in {FILES_DIR}")
     return None
 
 
 async def get_image_base64(item_id: str) -> Optional[dict]:
     info = await get_image_file_info(item_id)
     if not info:
+        logger.warning(f"[get_image_base64] no file info for item_id={item_id}")
         return None
     with open(info["file_path"], "rb") as f:
         data = f.read()
@@ -619,11 +628,12 @@ async def store_media_file(item_id: str, upload_file) -> dict:
         }
         file_ext = ext_map.get(ct, ".bin")
     file_path = os.path.join(FILES_DIR, f"{item_id}{file_ext}")
-
+    logger.info(f"[store_media_file] item_id={item_id} ext={file_ext} path={file_path}")
     content = await upload_file.read()
     content_hash = _hash_content(content)
     with open(file_path, "wb") as f:
         f.write(content)
+    logger.info(f"[store_media_file] written {len(content)} bytes to {file_path}")
 
     await db.execute(
         "UPDATE contentwall.items SET content_hash = :hash WHERE id = :id",
@@ -639,6 +649,7 @@ async def store_media_file(item_id: str, upload_file) -> dict:
 
 async def get_media_file_info(item_id: str) -> Optional[dict]:
     """Return path + content_type for an audio/video item, if found on disk."""
+    logger.info(f"[get_media_file_info] item_id={item_id} FILES_DIR={FILES_DIR}")
     candidates = [
         (".mp3", "audio/mpeg"), (".m4a", "audio/mp4"),
         (".aac", "audio/aac"), (".ogg", "audio/ogg"),
@@ -653,7 +664,9 @@ async def get_media_file_info(item_id: str) -> Optional[dict]:
     fp = os.path.join(FILES_DIR, f"{item_id}.bin")
     if os.path.exists(fp):
         ct = _guess_mime_from_magic(fp)
+        logger.info(f"[get_media_file_info] found .bin fallback: {fp} mime={ct}")
         return {"file_path": fp, "content_type": ct, "size": os.path.getsize(fp)}
+    logger.warning(f"[get_media_file_info] NO file found for item_id={item_id} in {FILES_DIR}")
     return None
 
 

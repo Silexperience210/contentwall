@@ -209,9 +209,14 @@ async def view_content(
         if item.markdown and article_content:
             article_html = render_markdown_safe(article_content)
     elif item.content_type == "image":
+        from loguru import logger
+        logger.info(f"[content_view] item_id={item_id} loading image")
         img = await get_image_base64(item_id)
         if img:
             image_data = f"data:{img['content_type']};base64,{img['data']}"
+            logger.info(f"[content_view] image loaded, mime={img['content_type']} len={len(img['data'])}")
+        else:
+            logger.warning(f"[content_view] image_data is None for item_id={item_id}")
     elif item.content_type == "bundle":
         bundle_files = [
             {

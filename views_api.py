@@ -220,24 +220,31 @@ async def api_upload_image(
     upload_file: UploadFile = File(...),
     wallet: WalletTypeInfo = Depends(require_admin_key),
 ):
+    from loguru import logger
+    logger.info(f"[api_upload_image] item_id={item_id} filename={upload_file.filename} mime={upload_file.content_type}")
     item = await get_item(item_id)
     if not item:
+        logger.warning(f"[api_upload_image] item not found: {item_id}")
         raise HTTPException(HTTPStatus.NOT_FOUND, "Item not found")
     if item.wallet != wallet.wallet.id:
+        logger.warning(f"[api_upload_image] wallet mismatch for item {item_id}")
         raise HTTPException(HTTPStatus.FORBIDDEN, "Not your item")
     if item.content_type != "image":
+        logger.warning(f"[api_upload_image] item {item_id} is not image, it's {item.content_type}")
         raise HTTPException(
             HTTPStatus.BAD_REQUEST, "Item is not an image type"
         )
 
     allowed = {"image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp"}
     if (upload_file.content_type or "") not in allowed:
+        logger.warning(f"[api_upload_image] rejected mime type: {upload_file.content_type}")
         raise HTTPException(
             HTTPStatus.BAD_REQUEST,
             "Invalid file type. Allowed: JPEG, PNG, GIF, WebP",
         )
 
     result = await store_image_file(item_id, upload_file)
+    logger.info(f"[api_upload_image] success item_id={item_id} size={result['size']}")
     return {
         "success": True,
         "size": result["size"],
