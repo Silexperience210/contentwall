@@ -158,10 +158,10 @@ async def api_item_create(
     data: CreateItem,
     wallet: WalletTypeInfo = Depends(require_admin_key),
 ):
-    if data.content_type not in ("article", "image", "bundle"):
+    if data.content_type not in ("article", "image", "bundle", "audio", "video"):
         raise HTTPException(
             HTTPStatus.BAD_REQUEST,
-            "content_type must be 'article', 'image' or 'bundle'",
+            "content_type must be 'article', 'image', 'bundle', 'audio' or 'video'",
         )
     if data.content_type == "article" and not data.article_content:
         raise HTTPException(
@@ -276,17 +276,29 @@ async def api_upload_media(
             HTTPStatus.BAD_REQUEST, "Item is not an audio or video type"
         )
 
-    ct = (upload_file.content_type or "").lower()
-    if item.content_type == "audio" and not ct.startswith("audio/"):
+    # Same approach as image upload: client mime is unreliable on mobile.
+    # store_media_file validates by magic bytes, falls back to filename ext.
+    try:
+        result = await store_media_file(item_id, upload_file)
+    except ValueError as exc:
+        logger.warning(f"[api_upload_media] rejected by magic-byte check: {exc}")
+        raise HTTPException(HTTPStatus.BAD_REQUEST, str(exc))
+
+    # Enforce item.content_type matches what was actually uploaded
+    real_kind = "audio" if result["content_type"].startswith("audio/") else "video"
+    if real_kind != item.content_type:
+        # Roll back: delete the file we just wrote
+        import os as _os
+        try:
+            _os.remove(result["file_path"])
+        except OSError:
+            pass
         raise HTTPException(
-            HTTPStatus.BAD_REQUEST, "Expected an audio/* MIME type"
-        )
-    if item.content_type == "video" and not ct.startswith("video/"):
-        raise HTTPException(
-            HTTPStatus.BAD_REQUEST, "Expected a video/* MIME type"
+            HTTPStatus.BAD_REQUEST,
+            f"You uploaded a {real_kind} file but this item is configured as "
+            f"{item.content_type!r}. Create a new item with the matching type.",
         )
 
-    result = await store_media_file(item_id, upload_file)
     return {
         "success": True,
         "size": result["size"],

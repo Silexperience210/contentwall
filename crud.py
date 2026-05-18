@@ -669,29 +669,87 @@ def verify_access_token(
 
 
 async def store_media_file(item_id: str, upload_file) -> dict:
-    """Store an audio/video file using the same flat-file scheme as images."""
+    """
+    Store an audio/video file. Like store_image_file, the client-provided
+    content_type is not trusted — Android often sends application/octet-stream
+    or video/* for valid MP4/WebM. We validate by magic bytes first, then fall
+    back to the filename extension. The extension on disk always matches the
+    detected MIME so the extension-based lookup in get_media_file_info works.
+    """
     _ensure_files_dir()
-    file_ext = os.path.splitext(upload_file.filename or "")[1].lower()
-    # Tolerate a broad set; the content_type is what we serve back.
-    if file_ext not in (".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav",
-                        ".mp4", ".webm", ".mkv", ".mov"):
-        ct = (upload_file.content_type or "").lower()
-        ext_map = {
-            "audio/mpeg": ".mp3",
-            "audio/mp4": ".m4a",
-            "audio/aac": ".aac",
-            "audio/ogg": ".ogg",
-            "audio/opus": ".opus",
-            "audio/wav": ".wav",
-            "video/mp4": ".mp4",
-            "video/webm": ".webm",
-            "video/x-matroska": ".mkv",
-            "video/quicktime": ".mov",
-        }
-        file_ext = ext_map.get(ct, ".bin")
-    file_path = os.path.join(FILES_DIR, f"{item_id}{file_ext}")
-    logger.info(f"[store_media_file] item_id={item_id} ext={file_ext} path={file_path}")
+
     content = await upload_file.read()
+    if not content:
+        raise ValueError("Uploaded file is empty")
+
+    real_mime = guess_mime_from_bytes(content[:32])
+    mime_to_ext = {
+        "audio/mpeg": ".mp3",
+        "audio/mp4": ".m4a",
+        "audio/aac": ".aac",
+        "audio/ogg": ".ogg",
+        "audio/opus": ".opus",
+        "audio/wav": ".wav",
+        "video/mp4": ".mp4",
+        "video/webm": ".webm",
+        "video/x-matroska": ".mkv",
+        "video/quicktime": ".mov",
+    }
+
+    if real_mime in mime_to_ext:
+        file_ext = mime_to_ext[real_mime]
+        effective_mime = real_mime
+    else:
+        # Recover from filename extension if magic bytes are inconclusive
+        ext_to_mime = {
+            ".mp3": "audio/mpeg",
+            ".m4a": "audio/mp4",
+            ".aac": "audio/aac",
+            ".ogg": "audio/ogg",
+            ".opus": "audio/ogg",
+            ".wav": "audio/wav",
+            ".mp4": "video/mp4",
+            ".webm": "video/webm",
+            ".mkv": "video/x-matroska",
+            ".mov": "video/quicktime",
+        }
+        fn_ext = os.path.splitext(upload_file.filename or "")[1].lower()
+        if fn_ext in ext_to_mime:
+            file_ext = fn_ext
+            effective_mime = ext_to_mime[fn_ext]
+        else:
+            raise ValueError(
+                f"File doesn't look like a supported media file "
+                f"(magic={real_mime}, filename={upload_file.filename!r}, "
+                f"client_mime={upload_file.content_type!r}). "
+                f"Supported audio: MP3, M4A, AAC, OGG, OPUS, WAV. "
+                f"Supported video: MP4, WebM, MKV, MOV."
+            )
+
+    file_path = os.path.join(FILES_DIR, f"{item_id}{file_ext}")
+    logger.info(
+        f"[store_media_file] item_id={item_id} ext={file_ext} "
+        f"mime={effective_mime} client_mime={upload_file.content_type!r} "
+        f"path={file_path}"
+    )
+
+    # Clean up any stale file from a previous upload under a different ext
+    for stale_ext in mime_to_ext.values():
+        if stale_ext == file_ext:
+            continue
+        stale = os.path.join(FILES_DIR, f"{item_id}{stale_ext}")
+        if os.path.exists(stale):
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
+    stale_bin = os.path.join(FILES_DIR, f"{item_id}.bin")
+    if os.path.exists(stale_bin) and stale_bin != file_path:
+        try:
+            os.remove(stale_bin)
+        except OSError:
+            pass
+
     content_hash = _hash_content(content)
     with open(file_path, "wb") as f:
         f.write(content)
@@ -705,7 +763,7 @@ async def store_media_file(item_id: str, upload_file) -> dict:
         "file_path": file_path,
         "content_hash": content_hash,
         "size": len(content),
-        "content_type": upload_file.content_type or "application/octet-stream",
+        "content_type": effective_mime,
     }
 
 
