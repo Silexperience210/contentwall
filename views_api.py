@@ -230,7 +230,7 @@ async def api_upload_image(
             HTTPStatus.BAD_REQUEST, "Item is not an image type"
         )
 
-    allowed = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+    allowed = {"image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp"}
     if (upload_file.content_type or "") not in allowed:
         raise HTTPException(
             HTTPStatus.BAD_REQUEST,

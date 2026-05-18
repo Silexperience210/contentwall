@@ -19,7 +19,42 @@ from .models import CreateItem, Item, ItemFile, ItemStats, Payment, UpdateItem
 
 db = Database("ext_contentwall")
 
-FILES_DIR = os.path.join("data", "contentwall", "files")
+def _resolve_files_dir() -> str:
+    try:
+        from lnbits.settings import settings
+        data_folder = settings.lnbits_data_folder
+    except Exception:
+        data_folder = os.environ.get("LNBITS_DATA_FOLDER", "data")
+    if not os.path.isabs(data_folder):
+        data_folder = os.path.abspath(data_folder)
+    return os.path.join(data_folder, "contentwall", "files")
+
+
+FILES_DIR = _resolve_files_dir()
+
+
+def _guess_mime_from_magic(file_path: str) -> str:
+    with open(file_path, "rb") as f:
+        header = f.read(16)
+    if header.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if header.startswith(b"GIF87a") or header.startswith(b"GIF89a"):
+        return "image/gif"
+    if header.startswith(b"RIFF") and len(header) >= 12 and header[8:12] == b"WEBP":
+        return "image/webp"
+    if header.startswith(b"ID3") or header[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
+        return "audio/mpeg"
+    if header.startswith(b"OggS"):
+        return "audio/ogg"
+    if header.startswith(b"RIFF") and len(header) >= 12 and header[8:12] == b"WAVE":
+        return "audio/wav"
+    if len(header) >= 8 and header[4:8] == b"ftyp":
+        return "video/mp4"
+    if header.startswith(b"\x1a\x45\xdf\xa3"):
+        return "video/webm"
+    return "application/octet-stream"
 
 
 def _ensure_files_dir():
@@ -228,11 +263,7 @@ async def get_image_file_info(item_id: str) -> Optional[dict]:
             return {"file_path": fp, "content_type": ct, "size": os.path.getsize(fp)}
     fp = os.path.join(FILES_DIR, f"{item_id}.bin")
     if os.path.exists(fp):
-        row = await db.fetchone(
-            "SELECT content_type FROM contentwall.items WHERE id = :id",
-            {"id": item_id},
-        )
-        ct = row["content_type"] if row else "application/octet-stream"
+        ct = _guess_mime_from_magic(fp)
         return {"file_path": fp, "content_type": ct, "size": os.path.getsize(fp)}
     return None
 
@@ -621,11 +652,7 @@ async def get_media_file_info(item_id: str) -> Optional[dict]:
             return {"file_path": fp, "content_type": ct, "size": os.path.getsize(fp)}
     fp = os.path.join(FILES_DIR, f"{item_id}.bin")
     if os.path.exists(fp):
-        row = await db.fetchone(
-            "SELECT content_type FROM contentwall.items WHERE id = :id",
-            {"id": item_id},
-        )
-        ct = row["content_type"] if row else "application/octet-stream"
+        ct = _guess_mime_from_magic(fp)
         return {"file_path": fp, "content_type": ct, "size": os.path.getsize(fp)}
     return None
 
