@@ -141,6 +141,14 @@
         </div>
 
         {% elif content_type == 'audio' %}
+        {% if thumbnail_url %}
+        <div class="text-center q-mb-md">
+          <img src="{{ thumbnail_url }}" alt="Cover"
+               style="max-width: 240px; border-radius: 8px;
+                      border: 1px solid rgba(255,107,0,0.25);
+                      box-shadow: 0 0 18px rgba(255,107,0,0.25);" />
+        </div>
+        {% endif %}
         <audio controls preload="metadata" class="cw-media" style="height: 56px;">
           {% if media_url %}
           <source src="{{ media_url }}" type="{{ media_mime }}">
@@ -149,7 +157,8 @@
         </audio>
 
         {% elif content_type == 'video' %}
-        <video controls preload="metadata" class="cw-media" playsinline>
+        <video controls preload="metadata" class="cw-media" playsinline
+               {% if thumbnail_url %}poster="{{ thumbnail_url }}"{% endif %}>
           {% if media_url %}
           <source src="{{ media_url }}" type="{{ media_mime }}">
           {% endif %}

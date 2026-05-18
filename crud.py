@@ -189,6 +189,8 @@ async def delete_item(item_id: str) -> None:
         ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav",
         # video
         ".mp4", ".webm", ".mkv", ".mov",
+        # thumbnails (video poster, extracted client-side at upload time)
+        ".thumb.jpg",
         # fallback + tmp from interrupted streaming uploads
         ".bin", ".upload",
     ]
@@ -856,6 +858,57 @@ async def get_media_file_info(item_id: str) -> Optional[dict]:
         return {"file_path": fp, "content_type": ct, "size": os.path.getsize(fp)}
     logger.warning(f"[get_media_file_info] NO file found for item_id={item_id} in {FILES_DIR}")
     return None
+
+
+# ---------------------------------------------------------------------------
+# Thumbnails (extracted client-side from videos, stored alongside the media)
+# ---------------------------------------------------------------------------
+
+
+async def store_thumbnail_file(item_id: str, upload_file) -> dict:
+    """
+    Store a thumbnail image for a video/audio item. Always saved as JPEG
+    under {item_id}.thumb.jpg. The bytes come from the client (canvas
+    extraction of a video frame), so we validate magic but don't trust
+    the client mime — same robustness as store_image_file.
+    """
+    _ensure_files_dir()
+
+    content = await upload_file.read()
+    if not content:
+        raise ValueError("Empty thumbnail upload")
+
+    real_mime = guess_mime_from_bytes(content[:16])
+    if real_mime not in ("image/jpeg", "image/png", "image/webp"):
+        raise ValueError(
+            f"Thumbnail must be JPEG/PNG/WebP (got magic={real_mime})"
+        )
+
+    # Cap size at 1 MB — a 640px JPEG should be ~100-200 KB; anything bigger
+    # is either not a real thumbnail or someone trying to abuse the endpoint.
+    if len(content) > 1024 * 1024:
+        raise ValueError(
+            f"Thumbnail too large ({len(content)} bytes; max 1 MB)"
+        )
+
+    file_path = os.path.join(FILES_DIR, f"{item_id}.thumb.jpg")
+    with open(file_path, "wb") as f:
+        f.write(content)
+    logger.info(
+        f"[store_thumbnail_file] item_id={item_id} size={len(content)} "
+        f"mime={real_mime} path={file_path}"
+    )
+    return {
+        "file_path": file_path,
+        "size": len(content),
+        "content_type": "image/jpeg",
+    }
+
+
+def get_thumbnail_path(item_id: str) -> Optional[str]:
+    """Return absolute path of the thumbnail if it exists, else None."""
+    fp = os.path.join(FILES_DIR, f"{item_id}.thumb.jpg")
+    return fp if os.path.exists(fp) else None
 
 
 # ---------------------------------------------------------------------------

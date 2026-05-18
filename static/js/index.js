@@ -229,6 +229,62 @@ window.app = Vue.createApp({
       this.itemDialog.data.bundle_files = Array.from(files || []);
     },
 
+    // Extract a thumbnail from a video file using a canvas. Seeks to 1s
+    // (or 10% of duration for very short clips) and draws the frame to a
+    // canvas, exported as JPEG. Caps dimensions at 640px to keep size small.
+    // No server-side ffmpeg required.
+    _extractVideoThumbnail(file) {
+      return new Promise((resolve, reject) => {
+        const video = document.createElement('video');
+        video.preload = 'metadata';
+        video.muted = true;
+        video.playsInline = true;
+        video.crossOrigin = 'anonymous';
+        const url = URL.createObjectURL(file);
+        let timedOut = false;
+        const timeout = setTimeout(() => {
+          timedOut = true;
+          URL.revokeObjectURL(url);
+          reject(new Error('Thumbnail extraction timed out'));
+        }, 20000);
+
+        video.addEventListener('loadedmetadata', () => {
+          const seekTo = Math.min(1, (video.duration || 1) * 0.1);
+          try { video.currentTime = seekTo; }
+          catch (_) { /* Safari sometimes throws on early seek; retry on canplay */ }
+        });
+        video.addEventListener('seeked', () => {
+          if (timedOut) return;
+          try {
+            const w = video.videoWidth || 640;
+            const h = video.videoHeight || 360;
+            const ratio = Math.min(1, 640 / Math.max(w, h));
+            const canvas = document.createElement('canvas');
+            canvas.width = Math.max(1, Math.round(w * ratio));
+            canvas.height = Math.max(1, Math.round(h * ratio));
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            canvas.toBlob((blob) => {
+              clearTimeout(timeout);
+              URL.revokeObjectURL(url);
+              if (blob) resolve(blob);
+              else reject(new Error('Canvas.toBlob returned null'));
+            }, 'image/jpeg', 0.85);
+          } catch (err) {
+            clearTimeout(timeout);
+            URL.revokeObjectURL(url);
+            reject(err);
+          }
+        });
+        video.addEventListener('error', () => {
+          clearTimeout(timeout);
+          URL.revokeObjectURL(url);
+          reject(new Error('Could not load video for thumbnail extraction'));
+        });
+        video.src = url;
+      });
+    },
+
     // XHR-based upload so we get real progress events. `fetch()` has no
     // progress API, which made big video uploads look 'frozen' for minutes.
     // 30-min upload timeout is enough for several-hundred-MB files even on
@@ -362,6 +418,33 @@ window.app = Vue.createApp({
             wallet.adminkey,
             (pct) => { this.itemDialog.uploadProgress = pct; },
           );
+
+          // For videos, also extract and upload a thumbnail (poster image)
+          // for use on the paywall card and as the <video> poster after
+          // payment. Best-effort: failures here never block item creation.
+          if (d.content_type === 'video') {
+            this.itemDialog.uploadLabel = 'Generating thumbnail…';
+            this.itemDialog.uploadProgress = 0;
+            try {
+              const thumbBlob = await this._extractVideoThumbnail(d.media_file);
+              this.itemDialog.uploadLabel = 'Uploading thumbnail…';
+              await this._uploadWithProgress(
+                `/contentwall/api/v1/items/${itemId}/thumbnail`,
+                new File([thumbBlob], 'thumbnail.jpg', { type: 'image/jpeg' }),
+                wallet.adminkey,
+                (pct) => { this.itemDialog.uploadProgress = pct; },
+              );
+            } catch (thumbErr) {
+              // Don't fail item creation just because the thumbnail couldn't
+              // be generated (some codecs aren't decodable in canvas, etc.)
+              console.warn('Thumbnail extraction/upload skipped:', thumbErr);
+              this.$q.notify({
+                type: 'warning',
+                message: 'Video uploaded, but thumbnail could not be generated',
+                timeout: 4000,
+              });
+            }
+          }
         }
 
         // Bundle uploads

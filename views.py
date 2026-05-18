@@ -204,6 +204,7 @@ async def view_content(
     bundle_files = []
     media_url = None
     media_mime = None
+    thumbnail_url = None
     if item.content_type == "article":
         article_content = await get_article_content(item_id)
         if item.markdown and article_content:
@@ -229,7 +230,7 @@ async def view_content(
             for f in await get_item_files(item_id)
         ]
     elif item.content_type in ("audio", "video"):
-        from .crud import get_media_file_info
+        from .crud import get_media_file_info, get_thumbnail_path
         info = await get_media_file_info(item_id)
         if info:
             media_mime = info["content_type"]
@@ -237,6 +238,8 @@ async def view_content(
                 f"/contentwall/api/v1/items/media/{item_id}"
                 f"?payment_hash={payment_hash}&t={t or ''}"
             )
+        if get_thumbnail_path(item_id):
+            thumbnail_url = f"/contentwall/api/v1/items/{item_id}/thumbnail"
 
     return contentwall_renderer().TemplateResponse(
         "contentwall/content.html",
@@ -253,6 +256,7 @@ async def view_content(
             "bundle_files": bundle_files,
             "media_url": media_url,
             "media_mime": media_mime,
+            "thumbnail_url": thumbnail_url,
             "payment_hash": payment_hash,
             "access_token": t or "",
             "allow_tips": bool(item.allow_tips),

@@ -72,6 +72,26 @@
     border-radius: 8px;
     border: 1px solid rgba(255,107,0,0.25);
   }
+  .cw-teaser-thumb {
+    max-width: 100%;
+    border-radius: 8px;
+    border: 1px solid rgba(255,107,0,0.35);
+    box-shadow: 0 0 18px rgba(255,107,0,0.25);
+  }
+  .cw-teaser-thumb-wrap {
+    position: relative;
+    text-align: center;
+  }
+  .cw-teaser-thumb-play {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+    text-shadow: 0 0 16px rgba(0,0,0,0.7);
+    opacity: 0.9;
+  }
   .cw-mono { font-family: monospace; word-break: break-all; }
   .cw-bullet {
     width: 6px; height: 6px; border-radius: 50%;
@@ -146,15 +166,28 @@ document.addEventListener('DOMContentLoaded', () => document.body.classList.add(
               </li>
             </ul>
           </div>
-          <div v-else-if="preview.content_type === 'audio'" class="cw-teaser-article">
-            <q-icon name="music_note" style="color: var(--cw-orange);" class="q-mr-xs"></q-icon>
-            Audio file · <span v-text="(preview.media_size / (1024*1024)).toFixed(1) + ' MB'"></span>
-            <div v-if="preview.teaser_text" class="q-mt-sm" v-text="preview.teaser_text"></div>
+          <div v-else-if="preview.content_type === 'audio'">
+            <div v-if="preview.thumbnail_url" class="text-center q-mb-sm">
+              <img :src="preview.thumbnail_url" class="cw-teaser-thumb" alt="Audio cover" />
+            </div>
+            <div class="cw-teaser-article">
+              <q-icon name="music_note" style="color: var(--cw-orange);" class="q-mr-xs"></q-icon>
+              Audio file · <span v-text="(preview.media_size / (1024*1024)).toFixed(1) + ' MB'"></span>
+              <div v-if="preview.teaser_text" class="q-mt-sm" v-text="preview.teaser_text"></div>
+            </div>
           </div>
-          <div v-else-if="preview.content_type === 'video'" class="cw-teaser-article">
-            <q-icon name="movie" style="color: var(--cw-orange);" class="q-mr-xs"></q-icon>
-            Video file · <span v-text="(preview.media_size / (1024*1024)).toFixed(1) + ' MB'"></span>
-            <div v-if="preview.teaser_text" class="q-mt-sm" v-text="preview.teaser_text"></div>
+          <div v-else-if="preview.content_type === 'video'">
+            <div v-if="preview.thumbnail_url" class="cw-teaser-thumb-wrap q-mb-sm">
+              <img :src="preview.thumbnail_url" class="cw-teaser-thumb" alt="Video preview" />
+              <div class="cw-teaser-thumb-play">
+                <q-icon name="play_circle_filled" size="64px" style="color: white;"></q-icon>
+              </div>
+            </div>
+            <div class="cw-teaser-article">
+              <q-icon name="movie" style="color: var(--cw-orange);" class="q-mr-xs"></q-icon>
+              Video file · <span v-text="(preview.media_size / (1024*1024)).toFixed(1) + ' MB'"></span>
+              <div v-if="preview.teaser_text" class="q-mt-sm" v-text="preview.teaser_text"></div>
+            </div>
           </div>
         </div>
 

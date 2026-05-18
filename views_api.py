@@ -319,6 +319,65 @@ async def api_upload_media(
     }
 
 
+@contentwall_api_router.post("/api/v1/items/{item_id}/thumbnail")
+async def api_upload_thumbnail(
+    item_id: str,
+    upload_file: UploadFile = File(...),
+    wallet: WalletTypeInfo = Depends(require_admin_key),
+):
+    """
+    Upload a thumbnail (poster image) for a video or audio item. The
+    thumbnail is extracted client-side from a video frame at upload time
+    (no ffmpeg dependency on the host). Always stored as JPEG.
+    """
+    from .crud import store_thumbnail_file
+
+    item = await get_item(item_id)
+    if not item:
+        raise HTTPException(HTTPStatus.NOT_FOUND, "Item not found")
+    if item.wallet != wallet.wallet.id:
+        raise HTTPException(HTTPStatus.FORBIDDEN, "Not your item")
+    if item.content_type not in ("audio", "video"):
+        raise HTTPException(
+            HTTPStatus.BAD_REQUEST,
+            "Thumbnails are only supported on audio/video items",
+        )
+
+    try:
+        result = await store_thumbnail_file(item_id, upload_file)
+    except ValueError as exc:
+        raise HTTPException(HTTPStatus.BAD_REQUEST, str(exc))
+
+    return {"success": True, "size": result["size"]}
+
+
+@contentwall_api_router.get("/api/v1/items/{item_id}/thumbnail")
+async def api_get_thumbnail(item_id: str):
+    """
+    Public endpoint: serves the thumbnail JPEG for a video/audio item.
+    Safe to expose — thumbnails are meant to be seen on the paywall card
+    before payment. Returns 404 if no thumbnail was uploaded.
+    """
+    from .crud import get_thumbnail_path
+
+    fp = get_thumbnail_path(item_id)
+    if not fp:
+        raise HTTPException(HTTPStatus.NOT_FOUND, "No thumbnail")
+
+    def iterfile():
+        with open(fp, "rb") as f:
+            yield from f
+
+    return StreamingResponse(
+        iterfile(),
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "public, max-age=86400",
+            "Content-Disposition": f'inline; filename="{item_id}.thumb.jpg"',
+        },
+    )
+
+
 # ---- Bundle multi-file -----------------------------------------------------
 
 
@@ -860,13 +919,19 @@ async def api_get_preview(item_id: str):
         }
 
     if item.content_type in ("audio", "video"):
+        from .crud import get_thumbnail_path
         info = await get_media_file_info(item_id)
+        thumbnail_url = (
+            f"/contentwall/api/v1/items/{item_id}/thumbnail"
+            if get_thumbnail_path(item_id) else None
+        )
         return {
             "content_type": item.content_type,
             "teaser_text": item.teaser_text,
             "media_present": info is not None,
             "media_size": info["size"] if info else 0,
             "media_mime": info["content_type"] if info else None,
+            "thumbnail_url": thumbnail_url,
         }
 
     return {"content_type": item.content_type}
