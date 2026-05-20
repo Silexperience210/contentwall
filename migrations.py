@@ -24,8 +24,10 @@ async def m001_initial(db: Connection):
         """
     )
     await db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_contentwall_items_wallet ON items(wallet);"
+        "CREATE INDEX IF NOT EXISTS idx_contentwall_items_wallet "
+        "ON contentwall.items(wallet);"
     )
+
     await db.execute(
         f"""
         CREATE TABLE IF NOT EXISTS contentwall.payments (
@@ -39,14 +41,14 @@ async def m001_initial(db: Connection):
         """
     )
     await db.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_contentwall_payments_hash ON payments(item_id, payment_hash);"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_contentwall_payments_hash "
+        "ON contentwall.payments(item_id, payment_hash);"
     )
 
 
 async def _column_exists(db: Connection, table: str, column: str) -> bool:
     """
     Cross-DB column existence check.
-
     LNbits supports both SQLite and Postgres. PRAGMA is SQLite-only; the
     information_schema fallback handles Postgres.
     """
@@ -56,6 +58,7 @@ async def _column_exists(db: Connection, table: str, column: str) -> bool:
             return any(r["name"] == column for r in rows)
     except Exception:
         pass
+
     try:
         row = await db.fetchone(
             """
@@ -77,20 +80,21 @@ async def _add_column_if_missing(
     """Idempotent ALTER TABLE ... ADD COLUMN."""
     if await _column_exists(db, table, column):
         return
-    await db.execute(f"ALTER TABLE contentwall.{table} ADD COLUMN {column} {ddl_type};")
+    await db.execute(
+        f"ALTER TABLE contentwall.{table} ADD COLUMN {column} {ddl_type};"
+    )
 
 
 async def m002_extended_fields(db: Connection):
     """
     v1.1.0 extended schema. New columns introduced for:
-
-    * Teaser preview                -> teaser_text, teaser_blur
-    * Soft delete / archival        -> archived_at
-    * Per-purchase access duration  -> access_duration_seconds, expires_at
-    * Per-purchase view counter     -> views_count, max_views
-    * Signed access URLs (HMAC)     -> access_signing_key
-    * Outbound webhooks             -> webhook_url
-    * Multi-file bundles            -> item_files table
+      * Teaser preview          -> teaser_text, teaser_blur
+      * Soft delete / archival  -> archived_at
+      * Per-purchase access     -> access_duration_seconds, expires_at
+      * Per-purchase view count -> views_count, max_views
+      * Signed access URLs HMAC -> access_signing_key
+      * Outbound webhooks       -> webhook_url
+      * Multi-file bundles      -> item_files table
     """
     await _add_column_if_missing(db, "items", "teaser_text", "TEXT")
     await _add_column_if_missing(db, "items", "teaser_blur", "INTEGER DEFAULT 1")
@@ -101,7 +105,6 @@ async def m002_extended_fields(db: Connection):
     await _add_column_if_missing(db, "items", "access_signing_key", "TEXT")
     await _add_column_if_missing(db, "items", "webhook_url", "TEXT")
     await _add_column_if_missing(db, "items", "max_views", "INTEGER DEFAULT 0")
-
     await _add_column_if_missing(db, "payments", "expires_at", "TIMESTAMP")
     await _add_column_if_missing(db, "payments", "views_count", "INTEGER DEFAULT 0")
 
@@ -120,21 +123,19 @@ async def m002_extended_fields(db: Connection):
         """
     )
     await db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_contentwall_files_item ON item_files(item_id, position);"
+        "CREATE INDEX IF NOT EXISTS idx_contentwall_files_item "
+        "ON contentwall.item_files(item_id, position);"
     )
 
 
 async def m003_distribution_features(db: Connection):
     """
     v1.2.0 schema additions:
-
-    * Markdown rendering toggle       -> items.markdown
-    * Tip jar (post-purchase tips)    -> items.allow_tips
-                                         + new table tips
-    * Discount codes / coupons        -> new table coupons
-                                         + payments.coupon_code (audit)
-    * Embed widget tracking           -> nothing in DB
-    * Audio / video content types     -> just a content_type='audio'|'video' string
+      * Markdown rendering toggle -> items.markdown
+      * Tip jar (post-purchase)   -> items.allow_tips + new table tips
+      * Discount codes / coupons  -> new table coupons + payments.coupon_code
+      * Embed widget tracking     -> nothing in DB
+      * Audio / video content     -> content_type='audio'|'video' string
     """
     await _add_column_if_missing(db, "items", "markdown", "INTEGER DEFAULT 0")
     await _add_column_if_missing(db, "items", "allow_tips", "INTEGER DEFAULT 1")
@@ -156,7 +157,8 @@ async def m003_distribution_features(db: Connection):
         """
     )
     await db.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_contentwall_coupons_code ON coupons(item_id, code);"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_contentwall_coupons_code "
+        "ON contentwall.coupons(item_id, code);"
     )
 
     await db.execute(
@@ -173,5 +175,6 @@ async def m003_distribution_features(db: Connection):
         """
     )
     await db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_contentwall_tips_item ON tips(item_id);"
+        "CREATE INDEX IF NOT EXISTS idx_contentwall_tips_item "
+        "ON contentwall.tips(item_id);"
     )
