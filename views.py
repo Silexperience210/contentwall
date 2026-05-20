@@ -19,7 +19,6 @@ from lnbits.helpers import template_renderer
 
 from .crud import (
     get_article_content,
-    get_image_base64,
     get_item,
     get_item_files,
     has_paid,

@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import asyncio
 import csv
-import hashlib
 import io
 import json
 from datetime import datetime, timezone
@@ -75,7 +74,6 @@ from .crud import (
 )
 from .helpers import (
     article_teaser,
-    build_share_meta,
     encode_lnurl,
     fire_and_forget_webhook,
     iter_file_range,
@@ -94,7 +92,6 @@ from .models import (
     CreateItem,
     CreateTipData,
     Item,
-    PublicItem,
     UpdateItem,
 )
 from .tasks import paid_invoices

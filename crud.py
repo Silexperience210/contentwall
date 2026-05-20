@@ -14,6 +14,7 @@ from typing import Optional
 
 from lnbits.db import Database
 from lnbits.helpers import urlsafe_short_hash
+from loguru import logger
 
 from .models import CreateItem, Item, ItemFile, ItemStats, Payment, UpdateItem
 
@@ -71,7 +72,6 @@ def _ensure_files_dir():
     os.makedirs(FILES_DIR, exist_ok=True)
 
 
-from loguru import logger
 
 
 def _hash_content(content: bytes) -> str:
