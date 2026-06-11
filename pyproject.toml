@@ -1,6 +1,6 @@
 [project]
 name = "lnbits-contentwall"
-version = "1.2.11"
+version = "1.2.12"
 requires-python = ">=3.10,<3.13"
 description = "LNbits extension for real paywalls with server-hosted content"
 authors = [{ name = "Silexperience" }]
