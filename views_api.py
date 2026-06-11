@@ -92,6 +92,7 @@ from .models import (
     CreateItem,
     CreateTipData,
     Item,
+    PublicItem,
     UpdateItem,
 )
 from .tasks import paid_invoices
@@ -844,6 +845,43 @@ async def api_item_diagnostic(
         "authenticated": detailed,
     }
     return out
+
+
+@contentwall_api_router.get("/api/v1/items/{item_id}/public")
+async def api_get_public_item(item_id: str):
+    """
+    Public JSON slice of an item for native clients (e.g. the 21pay wallet) —
+    the same safe data the paywall page template embeds. No auth: everything
+    here is already visible on the public /contentwall/{item_id} page.
+    """
+    item = await get_item(item_id)
+    if not item:
+        raise HTTPException(HTTPStatus.NOT_FOUND, "Item not found")
+    if item.archived_at:
+        raise HTTPException(
+            HTTPStatus.GONE, "This content is no longer available"
+        )
+    file_count = 0
+    if item.content_type == "bundle":
+        file_count = len(await get_item_files(item_id))
+    return PublicItem(
+        id=item.id,
+        title=item.title,
+        description=item.description,
+        content_type=item.content_type,
+        amount=item.amount,
+        currency=item.currency,
+        memo=item.memo,
+        release_delay_seconds=item.release_delay_seconds or 0,
+        scheduled_at=item.scheduled_at,
+        teaser_text=item.teaser_text,
+        teaser_blur=bool(item.teaser_blur),
+        access_duration_seconds=item.access_duration_seconds or 0,
+        max_views=item.max_views or 0,
+        file_count=file_count,
+        markdown=bool(item.markdown),
+        allow_tips=bool(item.allow_tips),
+    )
 
 
 @contentwall_api_router.get("/api/v1/items/{item_id}/preview")
