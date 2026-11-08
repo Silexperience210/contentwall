@@ -82,6 +82,56 @@ def _new_signing_key() -> str:
     return secrets.token_urlsafe(32)
 
 
+def new_claim_secret() -> str:
+    """
+    Per-invoice bearer secret handed ONLY to the buyer who created the
+    invoice. Access is granted on proof of this secret (we store just its
+    hash), so merely knowing a payment_hash — which leaks through URLs, logs
+    and LNURL success actions — is no longer enough to unlock content.
+    """
+    return secrets.token_urlsafe(24)
+
+
+def hash_claim(claim: str) -> str:
+    return hashlib.sha256(claim.encode("utf-8")).hexdigest()
+
+
+def verify_claim(claim: str, claim_hash: str) -> bool:
+    if not claim or not claim_hash:
+        return False
+    return hmac.compare_digest(hash_claim(claim), claim_hash)
+
+
+def _wallet_in_clause(wallet_ids: list[str], prefix: str = "w") -> tuple[str, dict]:
+    """
+    Build a parameterised ``IN (:w0, :w1, ...)`` fragment and its bound params.
+
+    wallet_ids are always server-derived (the authed wallet or LNbits'
+    user.wallet_ids), never request-supplied free text, so they can't carry an
+    injection today — but interpolating identifiers straight into SQL is a
+    footgun one refactor away from a real hole. Binding them removes all doubt.
+    """
+    placeholders = ",".join(f":{prefix}{i}" for i in range(len(wallet_ids)))
+    params = {f"{prefix}{i}": wid for i, wid in enumerate(wallet_ids)}
+    return placeholders, params
+
+
+def _safe_fs_component(name: str) -> str:
+    """
+    Reduce a value to a single path component safe to join under FILES_DIR.
+
+    Content ids are server-generated urlsafe hashes with no separators, so this
+    is a no-op for legitimate traffic. It exists purely to neutralise any path
+    traversal (``..``, ``/``, NUL) should a raw, unvalidated id ever reach a
+    filesystem helper — e.g. the public thumbnail route, which serves by id
+    without a prior DB lookup.
+    """
+    base = os.path.basename(name or "")
+    if base in ("", ".", ".."):
+        return "__invalid__"
+    return base.replace("\x00", "")
+
+
 # ---------------------------------------------------------------------------
 # Items
 # ---------------------------------------------------------------------------
@@ -130,12 +180,13 @@ async def get_items(
 ) -> list[Item]:
     if not wallet_ids:
         return []
-    q = ",".join([f"'{w}'" for w in wallet_ids])
-    where = f"wallet IN ({q})"
+    placeholders, params = _wallet_in_clause(wallet_ids)
+    where = f"wallet IN ({placeholders})"
     if not include_archived:
         where += " AND archived_at IS NULL"
     return await db.fetchall(
         f"SELECT * FROM contentwall.items WHERE {where} ORDER BY created_at DESC",
+        params,
         model=Item,
     )
 
@@ -268,7 +319,7 @@ async def store_article_content(item_id: str, content: str) -> None:
     )
 
 
-async def store_image_file(item_id: str, upload_file) -> dict:
+async def store_image_file(item_id: str, upload_file, max_bytes: int = 0) -> dict:
     """
     Persist an uploaded image. The client-provided content_type is *not* trusted
     (mobile pickers often send 'application/octet-stream' or 'image/*'); the real
@@ -281,6 +332,10 @@ async def store_image_file(item_id: str, upload_file) -> dict:
     content = await upload_file.read()
     if not content:
         raise ValueError("Uploaded file is empty")
+    if max_bytes and len(content) > max_bytes:
+        raise ValueError(
+            f"Image too large ({len(content)} bytes; max {max_bytes})"
+        )
 
     # Detect real MIME from magic bytes (authoritative)
     real_mime = guess_mime_from_bytes(content[:16])
@@ -352,6 +407,7 @@ async def store_image_file(item_id: str, upload_file) -> dict:
 
 
 async def get_article_content(item_id: str) -> Optional[str]:
+    item_id = _safe_fs_component(item_id)
     fp = os.path.join(FILES_DIR, f"{item_id}.article")
     if not os.path.exists(fp):
         return None
@@ -360,6 +416,7 @@ async def get_article_content(item_id: str) -> Optional[str]:
 
 
 async def get_image_file_info(item_id: str) -> Optional[dict]:
+    item_id = _safe_fs_component(item_id)
     logger.info(f"[get_image_file_info] item_id={item_id} FILES_DIR={FILES_DIR}")
     for ext, ct in [
         (".jpg", "image/jpeg"), (".jpeg", "image/jpeg"),
@@ -395,12 +452,18 @@ async def get_image_base64(item_id: str) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 
-async def add_bundle_file(item_id: str, upload_file) -> ItemFile:
+async def add_bundle_file(item_id: str, upload_file, max_bytes: int = 0) -> ItemFile:
     """Store an extra file as part of a bundle item."""
     bundle_dir = os.path.join(FILES_DIR, "bundles", item_id)
     os.makedirs(bundle_dir, exist_ok=True)
 
     content = await upload_file.read()
+    if not content:
+        raise ValueError("Uploaded file is empty")
+    if max_bytes and len(content) > max_bytes:
+        raise ValueError(
+            f"File too large ({len(content)} bytes; max {max_bytes})"
+        )
     content_hash = _hash_content(content)
     file_id = urlsafe_short_hash()
     file_path = os.path.join(bundle_dir, file_id)
@@ -466,11 +529,28 @@ async def record_payment(
     payment_hash: str,
     amount_paid: int,
     access_duration_seconds: int = 0,
+    claim_hash: Optional[str] = None,
 ) -> Payment:
     now = datetime.now(timezone.utc)
     expires_at = None
     if access_duration_seconds and access_duration_seconds > 0:
         expires_at = (now + timedelta(seconds=access_duration_seconds)).isoformat()
+
+    # Idempotent: if the row already exists (WS listener + /check race), keep it
+    # but backfill the claim_hash if we now know it and it wasn't stored yet.
+    existing = await get_payment(item_id, payment_hash)
+    if existing:
+        if claim_hash and not existing.claim_hash:
+            await db.execute(
+                """
+                UPDATE contentwall.payments SET claim_hash = :ch
+                WHERE item_id = :iid AND payment_hash = :ph AND claim_hash IS NULL
+                """,
+                {"ch": claim_hash, "iid": item_id, "ph": payment_hash},
+            )
+            existing.claim_hash = claim_hash
+        return existing
+
     payment = Payment(
         id=urlsafe_short_hash(),
         item_id=item_id,
@@ -480,6 +560,7 @@ async def record_payment(
         created_at=now.isoformat(),
         expires_at=expires_at,
         views_count=0,
+        claim_hash=claim_hash,
     )
     await db.insert("contentwall.payments", payment)
     return payment
@@ -611,7 +692,7 @@ async def get_stats_for_wallets(wallet_ids: list[str]) -> dict[str, ItemStats]:
     """Bulk stats keyed by item_id, for use in the admin table."""
     if not wallet_ids:
         return {}
-    q = ",".join([f"'{w}'" for w in wallet_ids])
+    placeholders, params = _wallet_in_clause(wallet_ids)
     rows = await db.fetchall(
         f"""
         SELECT
@@ -622,9 +703,10 @@ async def get_stats_for_wallets(wallet_ids: list[str]) -> dict[str, ItemStats]:
             MAX(p.paid_at) AS last_payment_at
         FROM contentwall.items i
         LEFT JOIN contentwall.payments p ON p.item_id = i.id
-        WHERE i.wallet IN ({q})
+        WHERE i.wallet IN ({placeholders})
         GROUP BY i.id
-        """
+        """,
+        params,
     )
     out: dict[str, ItemStats] = {}
     for r in rows:
@@ -646,7 +728,8 @@ async def get_payments_by_day(wallet_ids: list[str], days: int = 30) -> list[dic
     if not wallet_ids:
         return []
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    q = ",".join([f"'{w}'" for w in wallet_ids])
+    placeholders, params = _wallet_in_clause(wallet_ids)
+    params["cutoff"] = cutoff
     rows = await db.fetchall(
         f"""
         SELECT
@@ -655,11 +738,11 @@ async def get_payments_by_day(wallet_ids: list[str], days: int = 30) -> list[dic
             COALESCE(SUM(p.amount_paid), 0) AS total_sats
         FROM contentwall.payments p
         JOIN contentwall.items i ON i.id = p.item_id
-        WHERE i.wallet IN ({q}) AND p.paid_at >= :cutoff
+        WHERE i.wallet IN ({placeholders}) AND p.paid_at >= :cutoff
         GROUP BY day
         ORDER BY day ASC
         """,
-        {"cutoff": cutoff},
+        params,
     )
     return [
         {
@@ -707,7 +790,7 @@ def verify_access_token(
 # ---------------------------------------------------------------------------
 
 
-async def store_media_file(item_id: str, upload_file) -> dict:
+async def store_media_file(item_id: str, upload_file, max_bytes: int = 0) -> dict:
     """
     Store an audio/video file. Like store_image_file, the client-provided
     content_type is not trusted — Android often sends application/octet-stream
@@ -805,9 +888,13 @@ async def store_media_file(item_id: str, upload_file) -> dict:
                 chunk = await upload_file.read(CHUNK)
                 if not chunk:
                     break
+                total += len(chunk)
+                if max_bytes and total > max_bytes:
+                    raise ValueError(
+                        f"Media file too large (> {max_bytes} bytes)"
+                    )
                 f.write(chunk)
                 hasher.update(chunk)
-                total += len(chunk)
         if total <= 0:
             raise ValueError("Uploaded file is empty")
         os.replace(tmp_path, file_path)
@@ -839,6 +926,7 @@ async def store_media_file(item_id: str, upload_file) -> dict:
 
 async def get_media_file_info(item_id: str) -> Optional[dict]:
     """Return path + content_type for an audio/video item, if found on disk."""
+    item_id = _safe_fs_component(item_id)
     logger.info(f"[get_media_file_info] item_id={item_id} FILES_DIR={FILES_DIR}")
     candidates = [
         (".mp3", "audio/mpeg"), (".m4a", "audio/mp4"),
@@ -907,6 +995,7 @@ async def store_thumbnail_file(item_id: str, upload_file) -> dict:
 
 def get_thumbnail_path(item_id: str) -> Optional[str]:
     """Return absolute path of the thumbnail if it exists, else None."""
+    item_id = _safe_fs_component(item_id)
     fp = os.path.join(FILES_DIR, f"{item_id}.thumb.jpg")
     return fp if os.path.exists(fp) else None
 
@@ -954,38 +1043,77 @@ async def list_coupons(item_id: str) -> list[Coupon]:
     )
 
 
-async def delete_coupon(coupon_id: str) -> None:
-    await db.execute(
-        "DELETE FROM contentwall.coupons WHERE id = :id", {"id": coupon_id}
+async def get_coupon_by_id(coupon_id: str) -> Optional[Coupon]:
+    return await db.fetchone(
+        "SELECT * FROM contentwall.coupons WHERE id = :id",
+        {"id": coupon_id},
+        Coupon,
     )
+
+
+async def delete_coupon(coupon_id: str, item_id: Optional[str] = None) -> None:
+    # Scope the delete to the item when known so a creator can't delete a
+    # coupon that belongs to a different item (or a different user's item)
+    # just by knowing / guessing its id.
+    if item_id is not None:
+        await db.execute(
+            "DELETE FROM contentwall.coupons WHERE id = :id AND item_id = :iid",
+            {"id": coupon_id, "iid": item_id},
+        )
+    else:
+        await db.execute(
+            "DELETE FROM contentwall.coupons WHERE id = :id", {"id": coupon_id}
+        )
 
 
 async def consume_coupon(coupon: Coupon) -> bool:
     """
-    Atomic-ish consumption: decrement uses_remaining if non-unlimited,
-    bump uses_count. Returns True if successful, False if exhausted/expired.
+    Atomically consume one use of a coupon. Returns True on success, False if
+    exhausted or expired.
+
+    The decrement is a single conditional UPDATE guarded by the current
+    uses_remaining value, so two concurrent redemptions can't both pass an
+    earlier read-then-write check and over-spend the coupon.
     """
-    # Expiry check
+    # Expiry check (cheap, no row contention)
     if coupon.expires_at:
-        exp = datetime.fromisoformat(coupon.expires_at.replace("Z", "+00:00"))
-        if datetime.now(timezone.utc) > exp:
+        try:
+            exp = datetime.fromisoformat(
+                coupon.expires_at.replace("Z", "+00:00")
+            )
+            if datetime.now(timezone.utc) > exp:
+                return False
+        except ValueError:
             return False
-    # Uses check
-    if coupon.uses_remaining == 0:
-        return False
-    new_remaining = (
-        coupon.uses_remaining - 1 if coupon.uses_remaining > 0 else -1
-    )
-    await db.execute(
+
+    # Unlimited coupons: just bump the counter.
+    if coupon.uses_remaining < 0:
+        await db.execute(
+            """
+            UPDATE contentwall.coupons
+            SET uses_count = COALESCE(uses_count, 0) + 1
+            WHERE id = :id
+            """,
+            {"id": coupon.id},
+        )
+        return True
+
+    # Limited coupons: decrement only if still > 0, in one statement.
+    result = await db.execute(
         """
         UPDATE contentwall.coupons
         SET uses_count = COALESCE(uses_count, 0) + 1,
-            uses_remaining = :remaining
-        WHERE id = :id
+            uses_remaining = uses_remaining - 1
+        WHERE id = :id AND uses_remaining > 0
         """,
-        {"remaining": new_remaining, "id": coupon.id},
+        {"id": coupon.id},
     )
-    return True
+    rowcount = getattr(result, "rowcount", None)
+    if rowcount is None:
+        # Driver didn't report rowcount — re-read to confirm it actually moved.
+        fresh = await get_coupon_by_id(coupon.id)
+        return bool(fresh and fresh.uses_remaining < coupon.uses_remaining)
+    return rowcount > 0
 
 
 def apply_coupon_to_amount(amount: int, coupon: Coupon) -> int:
@@ -1038,14 +1166,15 @@ async def get_tips_total(wallet_ids: list[str]) -> int:
     """Sum of all tips across a user's items, for the dashboard."""
     if not wallet_ids:
         return 0
-    q = ",".join([f"'{w}'" for w in wallet_ids])
+    placeholders, params = _wallet_in_clause(wallet_ids)
     row = await db.fetchone(
         f"""
         SELECT COALESCE(SUM(t.amount_sats), 0) AS total
         FROM contentwall.tips t
         JOIN contentwall.items i ON i.id = t.item_id
-        WHERE i.wallet IN ({q})
-        """
+        WHERE i.wallet IN ({placeholders})
+        """,
+        params,
     )
     if not row:
         return 0
@@ -1057,37 +1186,66 @@ async def get_tips_total(wallet_ids: list[str]) -> int:
 # ---------------------------------------------------------------------------
 
 
-async def get_purchases_by_hashes(payment_hashes: list[str]) -> list[dict]:
+async def get_purchases_by_hashes(
+    entries: list[dict],
+) -> list[dict]:
     """
-    Given a list of payment_hashes (which the client tracks in localStorage),
-    return the matching items + token + expiry. We don't expose anything that
-    isn't already tied to a successful payment, so this remains safe to expose
-    without auth.
+    Restore the buyer's purchase list from the {payment_hash, claim} pairs the
+    client kept in localStorage.
+
+    A signed access token is returned ONLY for an entry whose claim secret
+    matches the stored claim_hash. Knowing a payment_hash alone (it leaks
+    through URLs and logs) no longer yields a usable credential — the entry is
+    still listed so the UI can show it, but flagged `needs_claim` with no token.
     """
-    if not payment_hashes:
+    if not entries:
         return []
-    # SQLite doesn't support tuple binding well; do it ourselves but safely.
-    safe = [h for h in payment_hashes if all(c in "0123456789abcdefABCDEF" for c in h)]
+
+    # Normalise + validate hashes (bind-safe), index claims by hash.
+    claim_by_hash: dict[str, str] = {}
+    safe: list[str] = []
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        h = e.get("payment_hash") or ""
+        if not h or len(h) > 128 or not all(
+            ch in "0123456789abcdefABCDEF" for ch in h
+        ):
+            continue
+        safe.append(h)
+        if e.get("claim"):
+            claim_by_hash[h] = e["claim"]
     if not safe:
         return []
-    placeholders = ",".join(f"'{h}'" for h in safe)
+
+    # Parameterised IN-clause (no string interpolation of user data).
+    placeholders = ",".join(f":h{i}" for i in range(len(safe)))
+    params = {f"h{i}": h for i, h in enumerate(safe)}
     rows = await db.fetchall(
         f"""
         SELECT
             p.item_id, p.payment_hash, p.amount_paid, p.paid_at,
-            p.expires_at, p.views_count,
+            p.expires_at, p.views_count, p.claim_hash,
             i.title, i.description, i.content_type,
             i.access_signing_key, i.max_views, i.archived_at
         FROM contentwall.payments p
         JOIN contentwall.items i ON i.id = p.item_id
         WHERE p.payment_hash IN ({placeholders})
         ORDER BY p.paid_at DESC
-        """
+        """,
+        params,
     )
     out = []
     for r in rows:
-        token = make_access_token(
-            r["access_signing_key"] or "", r["item_id"], r["payment_hash"]
+        claim_hash = r["claim_hash"]
+        provided = claim_by_hash.get(r["payment_hash"], "")
+        authorized = (not claim_hash) or verify_claim(provided, claim_hash)
+        token = (
+            make_access_token(
+                r["access_signing_key"] or "", r["item_id"], r["payment_hash"]
+            )
+            if authorized
+            else None
         )
         out.append({
             "item_id": r["item_id"],
@@ -1101,6 +1259,8 @@ async def get_purchases_by_hashes(payment_hashes: list[str]) -> list[dict]:
             "views_count": int(r["views_count"] or 0),
             "max_views": int(r["max_views"] or 0),
             "archived": r["archived_at"] is not None,
+            "needs_claim": not authorized,
+            "claim": provided if authorized else "",
             "token": token,
         })
     return out

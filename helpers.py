@@ -141,20 +141,97 @@ def make_blurred_preview(src_path: str) -> Optional[bytes]:
 # ---------------------------------------------------------------------------
 
 
+def is_safe_webhook_url(url: str) -> bool:
+    """
+    Reject webhook URLs that would let a creator turn the LNbits host into an
+    SSRF proxy: non-http(s) schemes and any host that resolves to a private,
+    loopback, link-local, or otherwise non-global address (incl. the cloud
+    metadata endpoint 169.254.169.254).
+    """
+    import ipaddress
+    import socket
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = parsed.hostname
+    if not host:
+        return False
+
+    # Resolve every address the host maps to; all must be global.
+    try:
+        infos = socket.getaddrinfo(host, parsed.port or 0, proto=socket.IPPROTO_TCP)
+    except Exception:
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            return False
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
+            return False
+    return True
+
+
+def _webhook_signature(payload_bytes: bytes) -> Optional[str]:
+    """
+    HMAC-SHA256 of the body keyed by CONTENTWALL_WEBHOOK_SECRET (if set), so a
+    receiver can verify the call really came from this node and wasn't forged.
+    """
+    import hashlib as _hl
+    import hmac as _hmac
+    import os as _os
+
+    secret = _os.environ.get("CONTENTWALL_WEBHOOK_SECRET", "")
+    if not secret:
+        return None
+    return _hmac.new(
+        secret.encode("utf-8"), payload_bytes, _hl.sha256
+    ).hexdigest()
+
+
 async def fire_webhook(url: str, payload: dict) -> None:
     """
     POST a JSON payload to a buyer-configured URL, fire-and-forget.
     Failures are logged but never raised so they can't break the payment flow.
+    The URL is re-validated at send time (TOCTOU: DNS could have changed since
+    it was saved) and the request never follows redirects (which could bounce
+    to an internal address).
     """
-    if not url:
+    if not url or not is_safe_webhook_url(url):
+        logger.warning("webhook skipped: url missing or not allowed")
         return
     try:
+        import json as _json
+
         import httpx
 
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(url, json=payload)
+        body = _json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        sig = _webhook_signature(body)
+        if sig:
+            headers["X-ContentWall-Signature"] = f"sha256={sig}"
+
+        async with httpx.AsyncClient(
+            timeout=10.0, follow_redirects=False
+        ) as client:
+            await client.post(url, content=body, headers=headers)
     except Exception as exc:
-        logger.warning(f"webhook to {url} failed: {exc}")
+        logger.warning(f"webhook delivery failed: {exc}")
 
 
 def fire_and_forget_webhook(url: str, payload: dict) -> None:
@@ -263,18 +340,41 @@ def render_markdown_safe(text: str) -> str:
         import html as _html
         return f'<div class="cw-plain">{_html.escape(text)}</div>'
 
-    # Strip dangerous tags defensively. mistune with escape=True already
-    # escapes raw HTML, but we add a belt-and-suspenders pass.
+    # Primary defense: a real HTML sanitizer (nh3 = Rust ammonia bindings) with
+    # a conservative allowlist. This is far more robust than regex stripping
+    # against mutation-XSS and malformed-markup tricks.
+    try:
+        import nh3
+
+        return nh3.clean(
+            html,
+            tags={
+                "p", "br", "hr", "h1", "h2", "h3", "h4", "h5", "h6",
+                "strong", "b", "em", "i", "u", "s", "del", "blockquote",
+                "ul", "ol", "li", "code", "pre", "a", "img", "table",
+                "thead", "tbody", "tr", "th", "td",
+            },
+            attributes={"a": {"href", "title", "rel"}, "img": {"src", "alt", "title"}},
+            url_schemes={"http", "https", "mailto"},
+            link_rel="noopener nofollow noreferrer",
+        )
+    except Exception:
+        pass
+
+    # Fallback (no nh3 installed): mistune with escape=True already escaped raw
+    # HTML; strip anything dangerous that could remain as a belt-and-suspenders.
     import re as _re
-    for bad in ("script", "style", "iframe", "object", "embed"):
+    for bad in ("script", "style", "iframe", "object", "embed", "svg", "math"):
         html = _re.sub(
             rf"<{bad}.*?>.*?</{bad}>", "", html, flags=_re.IGNORECASE | _re.DOTALL
         )
         html = _re.sub(rf"<{bad}[^>]*/?>", "", html, flags=_re.IGNORECASE)
     # Strip event handlers like onclick=
-    html = _re.sub(r"\son\w+=\"[^\"]*\"", "", html, flags=_re.IGNORECASE)
-    html = _re.sub(r"\son\w+='[^']*'", "", html, flags=_re.IGNORECASE)
-    html = _re.sub(r"javascript:", "", html, flags=_re.IGNORECASE)
+    html = _re.sub(r"\son\w+\s*=\s*\"[^\"]*\"", "", html, flags=_re.IGNORECASE)
+    html = _re.sub(r"\son\w+\s*=\s*'[^']*'", "", html, flags=_re.IGNORECASE)
+    html = _re.sub(r"\son\w+\s*=\s*[^\s>]+", "", html, flags=_re.IGNORECASE)
+    html = _re.sub(r"(href|src)\s*=\s*([\"']?)\s*javascript:", r"\1=\2", html, flags=_re.IGNORECASE)
+    html = _re.sub(r"(href|src)\s*=\s*([\"']?)\s*data:", r"\1=\2", html, flags=_re.IGNORECASE)
     return html
 
 
@@ -288,6 +388,7 @@ from threading import Lock     # noqa: E402
 
 _rate_state: dict[str, deque] = {}
 _rate_lock = Lock()
+_rate_last_sweep = 0.0
 
 
 def rate_limit_check(
@@ -297,20 +398,39 @@ def rate_limit_check(
     Return True if the call is allowed, False if rate-limited.
 
     Stores a deque of recent timestamps per key. Old entries are popped on
-    every call so memory stays bounded. This is per-process and per-instance
-    — fine for a single-server LNbits node, which is the common deployment.
+    every call so each key's memory stays bounded. This is per-process and
+    per-instance — fine for a single-server LNbits node, which is the common
+    deployment.
+
+    The key space is unbounded (one entry per IP+item pair), so a one-off
+    visitor used to leave a dict entry behind forever. A periodic sweep now
+    drops keys whose last hit is older than the window, keeping total memory
+    proportional to *active* clients rather than all clients ever seen.
     """
     import time
+    global _rate_last_sweep
     now = time.time()
     cutoff = now - window_seconds
     with _rate_lock:
         q = _rate_state.setdefault(key, deque())
         while q and q[0] < cutoff:
             q.popleft()
-        if len(q) >= max_requests:
-            return False
-        q.append(now)
-        return True
+        allowed = len(q) < max_requests
+        if allowed:
+            q.append(now)
+
+        # Opportunistic global sweep (at most every 5 min) so idle keys don't
+        # accumulate unboundedly on a long-running node.
+        if now - _rate_last_sweep > 300:
+            stale = [
+                k for k, dq in _rate_state.items()
+                if k != key and (not dq or dq[-1] < cutoff)
+            ]
+            for k in stale:
+                _rate_state.pop(k, None)
+            _rate_last_sweep = now
+
+        return allowed
 
 
 # ---------------------------------------------------------------------------

@@ -10,7 +10,7 @@ import io
 import json
 from datetime import datetime, timezone
 from http import HTTPStatus
-from typing import List
+from typing import List, Optional
 
 from fastapi import (
     APIRouter,
@@ -25,6 +25,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 from lnbits.core.models import WalletTypeInfo
 from lnbits.core.services import create_invoice
 from lnbits.decorators import require_admin_key, require_invoice_key
@@ -34,7 +35,6 @@ from .crud import (
     add_bundle_file,
     apply_coupon_to_amount,
     archive_item,
-    consume_coupon,
     create_coupon,
     create_item,
     db,
@@ -43,6 +43,7 @@ from .crud import (
     delete_item,
     get_article_content,
     get_coupon,
+    get_coupon_by_id,
     get_image_base64,
     get_image_file_info,
     get_item,
@@ -59,23 +60,27 @@ from .crud import (
     get_stats_for_wallets,
     get_tips_total,
     has_paid,
+    hash_claim,
     increment_view_count,
     is_payment_expired,
     list_coupons,
     list_payments_for_item,
     list_tips_for_item,
     make_access_token,
+    new_claim_secret,
     record_payment,
     record_tip,
     store_article_content,
     store_image_file,
     update_item,
     verify_access_token,
+    verify_claim,
 )
 from .helpers import (
     article_teaser,
     encode_lnurl,
     fire_and_forget_webhook,
+    is_safe_webhook_url,
     iter_file_range,
     make_blurred_preview,
     metadata_for_lnurl,
@@ -85,6 +90,12 @@ from .helpers import (
     render_markdown_safe,
     watermark_image_bytes,
 )
+
+# Max in-memory upload sizes. Images and thumbnails are read fully into RAM, so
+# they get a hard cap; media is streamed to disk in chunks and capped there.
+MAX_IMAGE_BYTES = 25 * 1024 * 1024       # 25 MB
+MAX_MEDIA_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
+MAX_BUNDLE_FILE_BYTES = 200 * 1024 * 1024  # 200 MB per bundle file
 from .models import (
     CheckPaymentData,
     CreateCoupon,
@@ -100,6 +111,25 @@ from .tasks import paid_invoices
 contentwall_api_router = APIRouter()
 
 
+def _enforce_upload_size(upload_file: UploadFile, max_bytes: int) -> None:
+    """
+    Best-effort pre-read size guard using the declared Content-Length of the
+    multipart part. Streaming writers additionally enforce the cap while
+    reading, so this is just an early, cheap rejection.
+    """
+    try:
+        size = getattr(upload_file, "size", None)
+        if size is not None and size > max_bytes:
+            raise HTTPException(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                f"File too large (max {max_bytes // (1024 * 1024)} MB)",
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+
+
 def _parse_extra(payment) -> dict:
     """Parse payment.extra which can be dict, JSON string, or None."""
     extra = payment.extra
@@ -113,6 +143,12 @@ def _parse_extra(payment) -> dict:
         except json.JSONDecodeError:
             return {}
     return {}
+
+
+def extra_tag_mismatch(payment, item_id: str) -> bool:
+    """True when a payment's extra is NOT a ContentWall invoice for this item."""
+    extra = _parse_extra(payment)
+    return extra.get("tag") != "contentwall" or extra.get("id") != item_id
 
 
 # ---------------------------------------------------------------------------
@@ -166,10 +202,20 @@ async def api_item_create(
             HTTPStatus.BAD_REQUEST, "article_content is required for article type"
         )
 
+    if data.webhook_url and not is_safe_webhook_url(data.webhook_url):
+        raise HTTPException(
+            HTTPStatus.BAD_REQUEST,
+            "Webhook URL must be http(s) and must not target a private, "
+            "loopback or link-local address.",
+        )
+
     item = await create_item(wallet.wallet.id, data)
     if data.content_type == "article" and data.article_content:
         await store_article_content(item.id, data.article_content)
-    return item
+    # Never expose the server-side HMAC signing key to any client.
+    out = item.dict()
+    out.pop("access_signing_key", None)
+    return out
 
 
 @contentwall_api_router.patch("/api/v1/items/{item_id}")
@@ -183,7 +229,16 @@ async def api_item_update(
         raise HTTPException(HTTPStatus.NOT_FOUND, "Item not found")
     if item.wallet != wallet.wallet.id:
         raise HTTPException(HTTPStatus.FORBIDDEN, "Not your item")
-    return await update_item(item_id, data)
+    if data.webhook_url and not is_safe_webhook_url(data.webhook_url):
+        raise HTTPException(
+            HTTPStatus.BAD_REQUEST,
+            "Webhook URL must be http(s) and must not target a private, "
+            "loopback or link-local address.",
+        )
+    updated = await update_item(item_id, data)
+    out = updated.dict() if updated else {}
+    out.pop("access_signing_key", None)
+    return out
 
 
 @contentwall_api_router.post("/api/v1/items/{item_id}/archive")
@@ -246,13 +301,17 @@ async def api_upload_image(
             HTTPStatus.BAD_REQUEST, "Item is not an image type"
         )
 
+    # Reject oversized uploads up front when the client advertises a size, so a
+    # multi-GB "image" can't be read entirely into RAM before validation.
+    _enforce_upload_size(upload_file, MAX_IMAGE_BYTES)
+
     # NOTE: client-provided content_type is NOT trusted. Mobile pickers and
     # some Android browsers send 'application/octet-stream' or 'image/*' even
     # for valid JPEG/PNG files. We let store_image_file validate by reading
     # the magic bytes — that's both safer (can't be spoofed by a header) and
     # more permissive (works with whatever the client actually sends).
     try:
-        result = await store_image_file(item_id, upload_file)
+        result = await store_image_file(item_id, upload_file, max_bytes=MAX_IMAGE_BYTES)
     except ValueError as exc:
         logger.warning(f"[api_upload_image] rejected by magic-byte check: {exc}")
         raise HTTPException(HTTPStatus.BAD_REQUEST, str(exc))
@@ -287,10 +346,12 @@ async def api_upload_media(
             HTTPStatus.BAD_REQUEST, "Item is not an audio or video type"
         )
 
+    _enforce_upload_size(upload_file, MAX_MEDIA_BYTES)
+
     # Same approach as image upload: client mime is unreliable on mobile.
     # store_media_file validates by magic bytes, falls back to filename ext.
     try:
-        result = await store_media_file(item_id, upload_file)
+        result = await store_media_file(item_id, upload_file, max_bytes=MAX_MEDIA_BYTES)
     except ValueError as exc:
         logger.warning(f"[api_upload_media] rejected by magic-byte check: {exc}")
         raise HTTPException(HTTPStatus.BAD_REQUEST, str(exc))
@@ -372,6 +433,7 @@ async def api_get_thumbnail(item_id: str):
         headers={
             "Cache-Control": "public, max-age=86400",
             "Content-Disposition": f'inline; filename="{item_id}.thumb.jpg"',
+            "X-Content-Type-Options": "nosniff",
         },
     )
 
@@ -394,7 +456,13 @@ async def api_bundle_add_file(
         raise HTTPException(
             HTTPStatus.BAD_REQUEST, "Item is not a bundle"
         )
-    bf = await add_bundle_file(item_id, upload_file)
+    _enforce_upload_size(upload_file, MAX_BUNDLE_FILE_BYTES)
+    try:
+        bf = await add_bundle_file(
+            item_id, upload_file, max_bytes=MAX_BUNDLE_FILE_BYTES
+        )
+    except ValueError as exc:
+        raise HTTPException(HTTPStatus.BAD_REQUEST, str(exc))
     return bf
 
 
@@ -468,6 +536,16 @@ async def api_export_csv(
         user = await get_user(wallet.wallet.user)
         wallet_ids = user.wallet_ids if user else []
 
+    def _csv_safe(value):
+        # Neutralise CSV/formula injection: a cell that a spreadsheet would
+        # treat as a formula (leading = + - @ or a control char) is prefixed
+        # with a single quote so Excel/Sheets render it as text. The item
+        # title is the only free-text field here and it's creator-controlled,
+        # but the export is opened by the creator — defence in depth.
+        if isinstance(value, str) and value and value[0] in ("=", "+", "-", "@", "\t", "\r"):
+            return "'" + value
+        return value
+
     items = await get_items(wallet_ids, include_archived=True)
     buf = io.StringIO()
     w = csv.writer(buf)
@@ -487,13 +565,13 @@ async def api_export_csv(
         for p in await list_payments_for_item(it.id):
             w.writerow(
                 [
-                    it.id,
-                    it.title,
-                    p.id,
-                    p.payment_hash,
+                    _csv_safe(it.id),
+                    _csv_safe(it.title),
+                    _csv_safe(p.id),
+                    _csv_safe(p.payment_hash),
                     p.amount_paid,
-                    p.paid_at or "",
-                    p.expires_at or "",
+                    _csv_safe(p.paid_at or ""),
+                    _csv_safe(p.expires_at or ""),
                     p.views_count,
                 ]
             )
@@ -544,17 +622,28 @@ async def api_create_invoice(
             )
 
     requested_amount = data.amount if data and data.amount else item.amount
+    # Clamp absurd custom amounts so a typo / abuse can't mint a huge invoice.
+    if requested_amount > item.amount * 1000 + 1_000_000:
+        raise HTTPException(HTTPStatus.BAD_REQUEST, "Amount too large")
 
-    # Coupon
+    # Coupon: VALIDATED here but only CONSUMED on payment confirmation, so an
+    # attacker can't exhaust a limited coupon by spamming unpaid invoices.
     applied_coupon = None
     if data and data.coupon_code:
         coupon = await get_coupon(item_id, data.coupon_code)
         if not coupon:
             raise HTTPException(HTTPStatus.BAD_REQUEST, "Invalid coupon code")
-        if not await consume_coupon(coupon):
-            raise HTTPException(
-                HTTPStatus.GONE, "Coupon is exhausted or expired"
-            )
+        if coupon.uses_remaining == 0:
+            raise HTTPException(HTTPStatus.GONE, "Coupon is exhausted")
+        if coupon.expires_at:
+            try:
+                exp = datetime.fromisoformat(
+                    coupon.expires_at.replace("Z", "+00:00")
+                )
+                if datetime.now(timezone.utc) > exp:
+                    raise HTTPException(HTTPStatus.GONE, "Coupon has expired")
+            except ValueError:
+                pass
         applied_coupon = coupon
         # Discount applies to the floor price, not to a custom tip amount.
         effective_min = apply_coupon_to_amount(item.amount, coupon)
@@ -567,7 +656,11 @@ async def api_create_invoice(
                 f"Minimum amount is {item.amount} {item.currency}",
             )
 
-    extra = {"tag": "contentwall", "id": item_id}
+    # Per-invoice bearer secret: the buyer keeps `claim`; we store only its hash
+    # (bound to the invoice via `ch`) so access never depends on payment_hash
+    # secrecy.
+    claim = new_claim_secret()
+    extra = {"tag": "contentwall", "id": item_id, "ch": hash_claim(claim)}
     if applied_coupon:
         extra["coupon_code"] = applied_coupon.code
 
@@ -582,6 +675,7 @@ async def api_create_invoice(
             "payment_hash": payment.payment_hash,
             "payment_request": payment.bolt11,
             "amount": requested_amount,
+            "claim": claim,
             "coupon_applied": applied_coupon.code if applied_coupon else None,
         }
     except Exception as exc:
@@ -604,14 +698,11 @@ async def api_check_payment(
     if not paid_amount:
         return {"paid": False}
 
-    # Build the signed content URL
-    token = make_access_token(
-        item.access_signing_key or "", item_id, data.payment_hash
-    )
+    # Build the content URL with payment_hash only. The browser that created
+    # this invoice holds the claim secret and appends it client-side, so this
+    # endpoint never hands out a usable credential for a merely-known hash.
     host = str(request.base_url).rstrip("/")
     qs = f"?payment_hash={data.payment_hash}"
-    if token:
-        qs += f"&t={token}"
     content_url = f"{host}/contentwall/content/{item_id}{qs}"
     onion_content_url = None
     if item.onion_hostname:
@@ -655,16 +746,23 @@ async def api_check_payment(
 @contentwall_api_router.get(
     "/api/v1/items/debug/{item_id}/{payment_hash}"
 )
-async def api_debug_payment(item_id: str, payment_hash: str):
+async def api_debug_payment(
+    item_id: str,
+    payment_hash: str,
+    wallet: WalletTypeInfo = Depends(require_admin_key),
+):
     """
-    v1.2.1 — diagnostic endpoint. Returns the FULL state of a payment so we
-    can tell at a glance why the paywall might say "waiting" while the user
-    swears they paid. Intentionally unauthenticated: it never leaks content,
-    only the boolean state of each step.
+    Admin-only payment diagnostic. Returns the full internal state of a payment
+    for troubleshooting. This used to be unauthenticated, which let anyone probe
+    payment existence and leaked the item's wallet id for any guessed hash — it
+    now requires the owning wallet's admin key.
+    """
+    owner = await get_item(item_id)
+    if not owner:
+        raise HTTPException(HTTPStatus.NOT_FOUND, "Item not found")
+    if owner.wallet != wallet.wallet.id:
+        raise HTTPException(HTTPStatus.FORBIDDEN, "Not your item")
 
-    Hit it directly from a browser:
-      GET /contentwall/api/v1/items/debug/<item_id>/<payment_hash>
-    """
     out: dict = {
         "item_id": item_id,
         "payment_hash": payment_hash,
@@ -772,6 +870,7 @@ async def api_item_diagnostic(
     item_id: str,
     payment_hash: str = Query(""),
     t: str = Query(""),
+    c: str = Query(""),
 ):
     """
     Self-service diagnostic for the most common failure modes (missing file,
@@ -785,21 +884,21 @@ async def api_item_diagnostic(
     if not item:
         raise HTTPException(HTTPStatus.NOT_FOUND, "Item not found")
 
-    # If the caller passes payment_hash + t and they verify, they get extra
-    # detail; otherwise just the basics so anyone can self-diagnose.
-    detailed = False
-    if payment_hash and t:
-        try:
-            detailed = await _verify_access(item, item_id, payment_hash, t)
-        except Exception:
-            detailed = False
+    # Self-diagnostic requires a valid credential (claim or token) for this
+    # purchase — it no longer leaks file inventory to anonymous callers.
+    try:
+        authorized = await _verify_access(item, item_id, payment_hash, t, c)
+    except Exception:
+        authorized = False
+    if not authorized:
+        raise HTTPException(HTTPStatus.FORBIDDEN, "Payment required")
 
     from .crud import FILES_DIR as _FD
 
     info_image = await get_image_file_info(item_id)
     info_media = await get_media_file_info(item_id)
 
-    # Inventory of every file on disk for this item id (regardless of ext)
+    # Only report presence + size (basename), never absolute server paths.
     matching_files = []
     try:
         if _os.path.isdir(_FD):
@@ -808,11 +907,11 @@ async def api_item_diagnostic(
                     fp = _os.path.join(_FD, name)
                     if _os.path.isfile(fp):
                         matching_files.append({
-                            "name": name,
+                            "name": _os.path.basename(name),
                             "size": _os.path.getsize(fp),
                         })
-    except Exception as exc:
-        matching_files.append({"error": str(exc)})
+    except Exception:
+        pass
 
     try:
         from PIL import Image  # noqa: F401
@@ -820,31 +919,19 @@ async def api_item_diagnostic(
     except Exception:
         pil_available = False
 
-    out = {
+    return {
         "item_id": item_id,
         "content_type": item.content_type,
-        "content_hash_db": item.content_hash,
-        "files_dir": _FD,
+        "has_content_hash": bool(item.content_hash),
         "files_dir_exists": _os.path.isdir(_FD),
         "matching_files_on_disk": matching_files,
-        "image_lookup": (
-            None if not info_image else {
-                "path": info_image["file_path"],
-                "content_type": info_image["content_type"],
-                "size": info_image["size"],
-            }
-        ),
-        "media_lookup": (
-            None if not info_media else {
-                "path": info_media["file_path"],
-                "content_type": info_media["content_type"],
-                "size": info_media["size"],
-            }
-        ),
+        "image_present": info_image is not None,
+        "image_mime": info_image["content_type"] if info_image else None,
+        "media_present": info_media is not None,
+        "media_mime": info_media["content_type"] if info_media else None,
         "pil_available": pil_available,
-        "authenticated": detailed,
+        "authenticated": True,
     }
-    return out
 
 
 @contentwall_api_router.get("/api/v1/items/{item_id}/public")
@@ -976,48 +1063,16 @@ async def api_get_preview(item_id: str):
 async def api_get_content(
     item_id: str,
     payment_hash: str,
-    t: str = Query("", description="Access token (HMAC)"),
+    t: str = Query("", description="Access token (HMAC, LNURL flow)"),
+    c: str = Query("", description="Claim secret (web flow)"),
 ):
     item = await get_item(item_id)
     if not item:
         raise HTTPException(HTTPStatus.NOT_FOUND, "Item not found")
 
-    if item.scheduled_at:
-        scheduled = datetime.fromisoformat(
-            item.scheduled_at.replace("Z", "+00:00")
-        )
-        if datetime.now(timezone.utc) < scheduled:
-            raise HTTPException(
-                HTTPStatus.FORBIDDEN, "This content is not yet available"
-            )
-
-    has_access = await _verify_access(item, item_id, payment_hash, t)
-    if not has_access:
-        raise HTTPException(HTTPStatus.FORBIDDEN, "Payment required")
-
-    release_delay = item.release_delay_seconds or 0
-    if release_delay > 0:
-        payment_ts = await get_payment_timestamp(item_id, payment_hash)
-        if payment_ts:
-            paid_at = datetime.fromisoformat(payment_ts.replace("Z", "+00:00"))
-            elapsed = (datetime.now(timezone.utc) - paid_at).total_seconds()
-            remaining = release_delay - int(elapsed)
-            if remaining > 0:
-                raise HTTPException(
-                    HTTPStatus.FORBIDDEN, f"Content available in {remaining}s"
-                )
-
-    if await is_payment_expired(item_id, payment_hash):
-        raise HTTPException(HTTPStatus.GONE, "Access has expired")
-
-    # Enforce view limit
-    if item.max_views and item.max_views > 0:
-        new_count = await increment_view_count(item_id, payment_hash)
-        if new_count > item.max_views:
-            raise HTTPException(
-                HTTPStatus.GONE,
-                f"View limit reached ({item.max_views})",
-            )
+    # One gate enforces schedule, credentialed payment, release delay, expiry
+    # and the view cap (this fetch consumes one view).
+    await _gate_access(item, item_id, payment_hash, t, c, count_view=True)
 
     response = {
         "content_type": item.content_type,
@@ -1042,7 +1097,7 @@ async def api_get_content(
         # over the embedded base64 (smaller payload, watermark applied).
         response["image_url"] = (
             f"/contentwall/api/v1/items/image/{item_id}"
-            f"?payment_hash={payment_hash}&t={t or ''}"
+            f"?payment_hash={payment_hash}&t={t or ''}&c={c or ''}"
         )
     elif item.content_type == "bundle":
         files = await get_item_files(item_id)
@@ -1069,6 +1124,7 @@ async def api_get_image_raw(
     item_id: str,
     payment_hash: str,
     t: str = Query("", description="Access token"),
+    c: str = Query("", description="Claim secret"),
     watermark: int = Query(1, description="Apply watermark (0/1)"),
 ):
     item = await get_item(item_id)
@@ -1077,11 +1133,9 @@ async def api_get_image_raw(
     if item.content_type != "image":
         raise HTTPException(HTTPStatus.BAD_REQUEST, "Item is not an image")
 
-    if not await _verify_access(item, item_id, payment_hash, t):
-        raise HTTPException(HTTPStatus.FORBIDDEN, "Payment required")
-
-    if await is_payment_expired(item_id, payment_hash):
-        raise HTTPException(HTTPStatus.GONE, "Access has expired")
+    # Sub-resource of the unlock: full gate (schedule/delay/expiry/view-cap),
+    # but doesn't consume a view on its own.
+    await _gate_access(item, item_id, payment_hash, t, c)
 
     file_info = await get_image_file_info(item_id)
     if not file_info:
@@ -1097,6 +1151,7 @@ async def api_get_image_raw(
                 headers={
                     "Content-Disposition": f'inline; filename="{item_id}.jpg"',
                     "Cache-Control": "private, no-store",
+                    "X-Content-Type-Options": "nosniff",
                 },
             )
 
@@ -1110,6 +1165,7 @@ async def api_get_image_raw(
         headers={
             "Content-Disposition": f'inline; filename="{item_id}"',
             "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
         },
     )
 
@@ -1120,6 +1176,7 @@ async def api_get_bundle_file(
     file_id: str,
     payment_hash: str,
     t: str = Query(""),
+    c: str = Query(""),
 ):
     item = await get_item(item_id)
     if not item:
@@ -1127,10 +1184,7 @@ async def api_get_bundle_file(
     if item.content_type != "bundle":
         raise HTTPException(HTTPStatus.BAD_REQUEST, "Item is not a bundle")
 
-    if not await _verify_access(item, item_id, payment_hash, t):
-        raise HTTPException(HTTPStatus.FORBIDDEN, "Payment required")
-    if await is_payment_expired(item_id, payment_hash):
-        raise HTTPException(HTTPStatus.GONE, "Access has expired")
+    await _gate_access(item, item_id, payment_hash, t, c)
 
     bf = await get_item_file(file_id)
     if not bf or bf.item_id != item_id:
@@ -1138,9 +1192,15 @@ async def api_get_bundle_file(
 
     import os as _os
     from .crud import FILES_DIR as _FD
-    file_path = _os.path.join(_FD, "bundles", item_id, bf.id)
+    # bf.id is a server-generated short hash, but join defensively against any
+    # path traversal in the stored id before touching the filesystem.
+    safe_id = _os.path.basename(bf.id)
+    file_path = _os.path.join(_FD, "bundles", item_id, safe_id)
     if not _os.path.exists(file_path):
         raise HTTPException(HTTPStatus.NOT_FOUND, "File missing on disk")
+
+    # Never let a client-supplied filename inject header content.
+    safe_name = (bf.filename or safe_id).replace('"', "").replace("\n", "").replace("\r", "")[:200]
 
     def iterfile():
         with open(file_path, "rb") as f:
@@ -1148,10 +1208,11 @@ async def api_get_bundle_file(
 
     return StreamingResponse(
         iterfile(),
-        media_type=bf.content_type,
+        media_type="application/octet-stream",
         headers={
-            "Content-Disposition": f'attachment; filename="{bf.filename}"',
+            "Content-Disposition": f'attachment; filename="{safe_name}"',
             "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
         },
     )
 
@@ -1219,12 +1280,25 @@ async def api_lnurlp_callback(
                 "comment": comment[:200] if comment else "",
             },
         )
+        # LNURL buyers have no browser to hold a claim secret, so we hand the
+        # HMAC access token to the paying wallet through the success URL. Only
+        # the wallet that paid receives it, so a merely-known payment_hash
+        # still can't unlock the content.
+        token = make_access_token(
+            item.access_signing_key or "", item_id, payment.payment_hash
+        )
+        success_url = (
+            f"{str(request.base_url).rstrip('/')}/contentwall/{item_id}"
+            f"?payment_hash={payment.payment_hash}"
+        )
+        if token:
+            success_url += f"&t={token}"
         return {
             "pr": payment.bolt11,
             "successAction": {
                 "tag": "url",
                 "description": "View your content",
-                "url": f"{str(request.base_url).rstrip('/')}/contentwall/{item_id}?payment_hash={payment.payment_hash}",
+                "url": success_url,
             },
             "routes": [],
         }
@@ -1255,7 +1329,19 @@ async def api_lnurlp_encoded(request: Request, item_id: str):
 async def websocket_payment_status(
     ws: WebSocket, item_id: str, payment_hash: str
 ):
+    parked = False
     try:
+        # Reject obviously bogus hashes before doing any work (a payment_hash is
+        # 64 hex chars); this also blocks junk keys from entering paid_invoices.
+        if (
+            not payment_hash
+            or len(payment_hash) != 64
+            or not all(ch in "0123456789abcdefABCDEF" for ch in payment_hash)
+        ):
+            await ws.accept()
+            await ws.send_text(json.dumps({"paid": False, "error": "bad hash"}))
+            return
+
         await ws.accept()
 
         item = await get_item(item_id)
@@ -1285,14 +1371,26 @@ async def websocket_payment_status(
             await ws.send_text(json.dumps({"paid": True}))
             return
 
+        # Only park a waiter for an invoice that actually exists and is ours —
+        # otherwise an attacker could pin unbounded queues with random hashes.
+        if payment is None or extra_tag_mismatch(payment, item_id):
+            await ws.send_text(json.dumps({"paid": False, "error": "unknown invoice"}))
+            return
+
+        # Bound the number of concurrently-parked waiters.
         if payment_hash not in paid_invoices:
+            if len(paid_invoices) >= 5000:
+                await ws.send_text(
+                    json.dumps({"paid": False, "error": "busy"})
+                )
+                return
             paid_invoices[payment_hash] = asyncio.Queue()
+        parked = True
 
         try:
             await asyncio.wait_for(
                 paid_invoices[payment_hash].get(), timeout=300
             )
-            del paid_invoices[payment_hash]
             await ws.send_text(json.dumps({"paid": True}))
         except asyncio.TimeoutError:
             await ws.send_text(json.dumps({"paid": False, "timeout": True}))
@@ -1304,6 +1402,9 @@ async def websocket_payment_status(
     except Exception as exc:
         logger.warning(f"WebSocket error: {exc}")
     finally:
+        # Always release the parked queue so a disconnect/timeout can't leak it.
+        if parked:
+            paid_invoices.pop(payment_hash, None)
         try:
             await ws.close()
         except Exception:
@@ -1363,54 +1464,168 @@ async def _is_payment_made(item: Item, payment_hash: str) -> int:
     return 0
 
 
-async def _verify_access(
-    item: Item, item_id: str, payment_hash: str, token: str = ""
-) -> bool:
-    # If a signing key + token are present, the token MUST match.
-    if item.access_signing_key:
-        if not token:
-            # Backwards-compat: allow legacy payments stored before HMAC was
-            # introduced. We can detect that via the payment having no token
-            # cached, in which case we still grant access if the payment row
-            # is in our DB.
-            pass
-        else:
-            if not verify_access_token(
-                item.access_signing_key, item_id, payment_hash, token
-            ):
-                return False
-
-    if item.remembers and await has_paid(item_id, payment_hash):
-        return True
+async def _confirm_and_record(item: Item, item_id: str, payment_hash: str):
+    """
+    Return the recorded Payment row for a genuinely-settled ContentWall invoice,
+    confirming against LNbits and recording it (idempotently) if needed. Returns
+    None when the invoice is unpaid, pending, or not ours. No credential check
+    here — that's the caller's job via _check_credential.
+    """
+    existing = await get_payment(item_id, payment_hash)
+    if existing:
+        return existing
 
     try:
         from lnbits.core.crud import get_standalone_payment
         from lnbits.core.services import check_transaction_status
 
         status = await check_transaction_status(item.wallet, payment_hash)
-        if not status.pending:
-            payment = await get_standalone_payment(
-                checking_id_or_hash=payment_hash,
-                incoming=True,
-                wallet_id=item.wallet,
-            )
-            if payment:
-                extra = _parse_extra(payment)
-                if (
-                    extra.get("tag") == "contentwall"
-                    and extra.get("id") == item_id
-                ):
-                    await record_payment(
-                        item_id,
-                        payment_hash,
-                        int(payment.amount / 1000),
-                        access_duration_seconds=item.access_duration_seconds
-                        or 0,
-                    )
-                    return True
+        if status.pending:
+            return None
+        payment = await get_standalone_payment(
+            checking_id_or_hash=payment_hash,
+            incoming=True,
+            wallet_id=item.wallet,
+        )
+        if not payment:
+            return None
+        extra = _parse_extra(payment)
+        if extra.get("tag") != "contentwall" or extra.get("id") != item_id:
+            return None
+        return await record_payment(
+            item_id,
+            payment_hash,
+            int(payment.amount / 1000),
+            access_duration_seconds=item.access_duration_seconds or 0,
+            claim_hash=extra.get("ch"),
+        )
     except Exception as exc:
-        logger.error(f"Error in _verify_access: {exc}")
-    return False
+        logger.error(f"Error in _confirm_and_record: {exc}")
+    return None
+
+
+def _check_credential(
+    item: Item, item_id: str, payment_hash: str, token: str, claim: str, payment
+) -> bool:
+    """
+    Decide whether the presented credentials actually authorize this payment.
+
+    Priority:
+      * claim secret  — the buyer's per-invoice bearer secret (web flow)
+      * HMAC token    — handed only to the payer via the LNURL success URL
+    Knowing the payment_hash alone is never sufficient.
+    """
+    if payment is not None and payment.claim_hash:
+        if claim and verify_claim(claim, payment.claim_hash):
+            return True
+        if (
+            token
+            and item.access_signing_key
+            and verify_access_token(
+                item.access_signing_key, item_id, payment_hash, token
+            )
+        ):
+            return True
+        return False
+
+    # No claim stored (true legacy payment, or an LNURL purchase made before the
+    # claim secret existed). Fall back to the HMAC token when the item has a key.
+    if item.access_signing_key:
+        return bool(
+            token
+            and verify_access_token(
+                item.access_signing_key, item_id, payment_hash, token
+            )
+        )
+
+    # Only items that never had a signing key (pre-v1.1.0) reach here.
+    return True
+
+
+async def _gate_access(
+    item: Item,
+    item_id: str,
+    payment_hash: str,
+    token: str = "",
+    claim: str = "",
+    *,
+    count_view: bool = False,
+) -> None:
+    """
+    Single choke-point every content endpoint goes through. Raises the right
+    HTTPException on any failure; returns None when access is granted.
+
+    Enforces, in order: scheduled release, genuine+credentialed payment,
+    per-purchase release delay, rental expiry, and the per-purchase view cap.
+    """
+    # 1. Scheduled publish time
+    if item.scheduled_at:
+        try:
+            scheduled = datetime.fromisoformat(
+                item.scheduled_at.replace("Z", "+00:00")
+            )
+        except ValueError:
+            scheduled = None
+        if scheduled and datetime.now(timezone.utc) < scheduled:
+            raise HTTPException(
+                HTTPStatus.FORBIDDEN, "This content is not yet available"
+            )
+
+    # 2. Genuine payment + credential
+    payment = await _confirm_and_record(item, item_id, payment_hash)
+    if payment is None:
+        raise HTTPException(HTTPStatus.FORBIDDEN, "Payment required")
+    if not _check_credential(item, item_id, payment_hash, token, claim, payment):
+        raise HTTPException(HTTPStatus.FORBIDDEN, "Payment required")
+
+    # 3. Release delay after payment
+    release_delay = item.release_delay_seconds or 0
+    if release_delay > 0 and payment.paid_at:
+        try:
+            paid_at = datetime.fromisoformat(
+                payment.paid_at.replace("Z", "+00:00")
+            )
+            remaining = release_delay - int(
+                (datetime.now(timezone.utc) - paid_at).total_seconds()
+            )
+            if remaining > 0:
+                raise HTTPException(
+                    HTTPStatus.FORBIDDEN, f"Content available in {remaining}s"
+                )
+        except ValueError:
+            pass
+
+    # 4. Rental expiry
+    if await is_payment_expired(item_id, payment_hash):
+        raise HTTPException(HTTPStatus.GONE, "Access has expired")
+
+    # 5. View cap. Sub-resources (count_view=False) check the current count
+    # without consuming one, so a single unlock can load its own media/image.
+    if item.max_views and item.max_views > 0:
+        if count_view:
+            new_count = await increment_view_count(item_id, payment_hash)
+            if new_count > item.max_views:
+                raise HTTPException(
+                    HTTPStatus.GONE, f"View limit reached ({item.max_views})"
+                )
+        else:
+            if (payment.views_count or 0) > item.max_views:
+                raise HTTPException(
+                    HTTPStatus.GONE, f"View limit reached ({item.max_views})"
+                )
+
+
+async def _verify_access(
+    item: Item, item_id: str, payment_hash: str, token: str = "", claim: str = ""
+) -> bool:
+    """
+    Boolean credential check (no gating side-effects) kept for the few callers
+    that only need 'is this request authorized at all'.
+    """
+    payment = await _confirm_and_record(item, item_id, payment_hash)
+    if payment is None:
+        return False
+    return _check_credential(item, item_id, payment_hash, token, claim, payment)
 
 
 # ===========================================================================
@@ -1430,6 +1645,7 @@ async def api_get_media(
     item_id: str,
     payment_hash: str,
     t: str = Query(""),
+    c: str = Query(""),
 ):
     """
     Range-aware streaming endpoint for audio/video.
@@ -1442,10 +1658,7 @@ async def api_get_media(
     if item.content_type not in ("audio", "video"):
         raise HTTPException(HTTPStatus.BAD_REQUEST, "Item is not media")
 
-    if not await _verify_access(item, item_id, payment_hash, t):
-        raise HTTPException(HTTPStatus.FORBIDDEN, "Payment required")
-    if await is_payment_expired(item_id, payment_hash):
-        raise HTTPException(HTTPStatus.GONE, "Access has expired")
+    await _gate_access(item, item_id, payment_hash, t, c)
 
     info = await get_media_file_info(item_id)
     if not info:
@@ -1459,6 +1672,7 @@ async def api_get_media(
         "Accept-Ranges": "bytes",
         "Content-Disposition": f'inline; filename="{item_id}"',
         "Cache-Control": "private, no-store",
+        "X-Content-Type-Options": "nosniff",
     }
 
     if request.method == "HEAD":
@@ -1546,7 +1760,12 @@ async def api_coupon_delete(
         raise HTTPException(HTTPStatus.NOT_FOUND, "Item not found")
     if item.wallet != wallet.wallet.id:
         raise HTTPException(HTTPStatus.FORBIDDEN, "Not your item")
-    await delete_coupon(coupon_id)
+    # Verify the coupon actually belongs to THIS item before deleting, so a
+    # creator can't delete another item's (or user's) coupon by id.
+    coupon = await get_coupon_by_id(coupon_id)
+    if not coupon or coupon.item_id != item_id:
+        raise HTTPException(HTTPStatus.NOT_FOUND, "Coupon not found")
+    await delete_coupon(coupon_id, item_id=item_id)
     return {"deleted": True}
 
 
@@ -1691,18 +1910,33 @@ async def api_tips_total(
 # ---------------------------------------------------------------------------
 
 
-class _MyPurchasesQuery(__import__('pydantic').BaseModel):
+class _PurchaseEntry(BaseModel):
+    payment_hash: str = ""
+    claim: Optional[str] = ""
+
+
+class _MyPurchasesQuery(BaseModel):
+    # New shape: {entries: [{payment_hash, claim}]}. The legacy {hashes:[...]}
+    # is still accepted (entries without a claim are listed but yield no
+    # credential).
+    entries: List[_PurchaseEntry] = []
     hashes: List[str] = []
 
 
 @contentwall_api_router.post("/api/v1/me/purchases")
 async def api_my_purchases(payload: _MyPurchasesQuery):
     """
-    Returns the items + signed access URLs for a list of payment_hashes
-    the client kept in localStorage. We only confirm what's already in our DB,
-    so there's no privacy leak: knowing a payment_hash already proves access.
+    Restore the buyer's purchase list from the {payment_hash, claim} pairs kept
+    in localStorage. A usable access token is only returned for an entry whose
+    claim secret matches — knowing a payment_hash alone is not enough.
     """
-    return await get_purchases_by_hashes(payload.hashes or [])
+    entries = [
+        {"payment_hash": (e.payment_hash or "")[:128], "claim": (e.claim or "")[:128]}
+        for e in payload.entries
+    ]
+    for h in payload.hashes or []:
+        entries.append({"payment_hash": (h or "")[:128], "claim": ""})
+    return await get_purchases_by_hashes(entries)
 
 
 # ---------------------------------------------------------------------------

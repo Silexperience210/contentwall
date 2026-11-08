@@ -82,6 +82,8 @@
           <q-input filled dark dense v-model="newHash" placeholder="payment_hash"
             style="min-width: 260px;"></q-input>
           <q-input filled dark dense v-model="newItemId" placeholder="item_id"
+            style="min-width: 160px;"></q-input>
+          <q-input filled dark dense v-model="newClaim" placeholder="claim (if you have it)"
             style="min-width: 200px;"></q-input>
           <q-btn outline color="orange" no-caps @click="addByHash">Add</q-btn>
         </div>
@@ -95,7 +97,7 @@
 <script>
 window.app = Vue.createApp({
   data() {
-    return { purchases: [], loading: true, newHash: '', newItemId: '' };
+    return { purchases: [], loading: true, newHash: '', newItemId: '', newClaim: '' };
   },
   async mounted() { await this.refresh(); },
   methods: {
@@ -110,12 +112,15 @@ window.app = Vue.createApp({
     async refresh() {
       this.loading = true;
       const local = this.readLocal();
-      const hashes = local.map(p => p.payment_hash);
+      const entries = local.map(p => ({
+        payment_hash: p.payment_hash,
+        claim: p.claim || '',
+      }));
       try {
         const r = await fetch('/contentwall/api/v1/me/purchases', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ hashes }),
+          body: JSON.stringify({ entries }),
         });
         this.purchases = r.ok ? await r.json() : [];
       } catch (_) {
@@ -125,8 +130,13 @@ window.app = Vue.createApp({
       }
     },
     contentUrl(p) {
-      const t = p.token ? `&t=${p.token}` : '';
-      return `/contentwall/content/${p.item_id}?payment_hash=${p.payment_hash}${t}`;
+      const parts = [`payment_hash=${encodeURIComponent(p.payment_hash)}`];
+      // Prefer the claim secret; fall back to the HMAC token for legacy/LNURL.
+      const localClaim = (this.readLocal().find(x => x.payment_hash === p.payment_hash) || {}).claim;
+      const claim = p.claim || localClaim;
+      if (claim) parts.push(`c=${encodeURIComponent(claim)}`);
+      else if (p.token) parts.push(`t=${encodeURIComponent(p.token)}`);
+      return `/contentwall/content/${p.item_id}?${parts.join('&')}`;
     },
     formatDate(d) {
       if (!d) return '';
@@ -140,11 +150,18 @@ window.app = Vue.createApp({
     async addByHash() {
       if (!this.newHash || !this.newItemId) return;
       const arr = this.readLocal();
-      if (!arr.find(p => p.payment_hash === this.newHash)) {
-        arr.push({ payment_hash: this.newHash, item_id: this.newItemId });
-        this.writeLocal(arr);
+      const existing = arr.find(p => p.payment_hash === this.newHash);
+      if (existing) {
+        if (this.newClaim) existing.claim = this.newClaim;
+      } else {
+        arr.push({
+          payment_hash: this.newHash,
+          item_id: this.newItemId,
+          claim: this.newClaim || '',
+        });
       }
-      this.newHash = ''; this.newItemId = '';
+      this.writeLocal(arr);
+      this.newHash = ''; this.newItemId = ''; this.newClaim = '';
       await this.refresh();
     },
   },
