@@ -104,6 +104,7 @@ class Payment(BaseModel):
     created_at: Optional[str] = None
     expires_at: Optional[str] = None
     views_count: int = 0
+    claim_hash: Optional[str] = None  # sha256 of the buyer's claim secret
 
 
 class CreateInvoiceData(BaseModel):

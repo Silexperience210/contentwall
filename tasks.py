@@ -85,6 +85,8 @@ async def on_invoice_paid(payment: Payment) -> None:
         # Imported inside the function to avoid an import cycle at module load
         # (crud -> models -> ... -> tasks).
         from .crud import (
+            consume_coupon,
+            get_coupon,
             get_item,
             has_paid,
             record_payment,
@@ -106,7 +108,16 @@ async def on_invoice_paid(payment: Payment) -> None:
                     payment_hash,
                     amount_sats,
                     access_duration_seconds=item.access_duration_seconds or 0,
+                    claim_hash=extra.get("ch"),
                 )
+                # Consume the coupon now that the payment is confirmed. Doing it
+                # here (not at invoice creation) means unpaid invoices can't
+                # drain a limited coupon.
+                coupon_code = extra.get("coupon_code")
+                if coupon_code and rec is not None:
+                    coupon = await get_coupon(item_id, coupon_code)
+                    if coupon:
+                        await consume_coupon(coupon)
                 logger.success(
                     f"contentwall: recorded payment item={item_id} "
                     f"hash={payment_hash} amount={amount_sats} sat"

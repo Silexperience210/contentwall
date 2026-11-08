@@ -22,6 +22,7 @@ window.app = Vue.createApp({
       userAmount: item.amount,
       paymentReq: null,
       paymentHash: null,
+      claim: null,
       loading: false,
       paid: false,
       expired: false,
@@ -97,6 +98,10 @@ window.app = Vue.createApp({
     const ph = urlParams.get('payment_hash');
     if (ph) {
       this.paymentHash = ph;
+      // Returning visitor (bookmark): the URL carries only payment_hash, but
+      // the claim secret was saved locally when they bought. Recover it so the
+      // content URL can be rebuilt with a valid credential.
+      this.claim = urlParams.get('c') || this.claimFromStorage(ph) || null;
       this.checkPayment();
     }
   },
@@ -172,6 +177,7 @@ window.app = Vue.createApp({
         const data = await resp.json();
         this.paymentReq = data.payment_request;
         this.paymentHash = data.payment_hash;
+        this.claim = data.claim || null;  // per-invoice bearer secret
         this.listenForPayment();
       } catch (err) {
         this.$q.notify({ type: 'negative', message: err.message || 'Failed to create invoice' });
@@ -215,18 +221,40 @@ window.app = Vue.createApp({
       try {
         const key = 'contentwall.purchases';
         const arr = JSON.parse(localStorage.getItem(key) || '[]');
-        if (!arr.find(p => p.payment_hash === this.paymentHash)) {
+        const existing = arr.find(p => p.payment_hash === this.paymentHash);
+        if (existing) {
+          // Backfill the claim if we now have it (e.g. re-opened a bookmark).
+          if (this.claim && !existing.claim) existing.claim = this.claim;
+        } else {
           arr.push({
             payment_hash: this.paymentHash,
             item_id: this.itemId,
             title: this.paywallTitle,
+            claim: this.claim || '',
             saved_at: new Date().toISOString(),
           });
-          localStorage.setItem(key, JSON.stringify(arr));
         }
+        localStorage.setItem(key, JSON.stringify(arr));
       } catch (_) {
         // localStorage may be disabled (private mode) — non-fatal.
       }
+    },
+
+    claimFromStorage(ph) {
+      try {
+        const arr = JSON.parse(localStorage.getItem('contentwall.purchases') || '[]');
+        const hit = arr.find(p => p.payment_hash === ph);
+        return hit && hit.claim ? hit.claim : null;
+      } catch (_) {
+        return null;
+      }
+    },
+
+    withClaim(url) {
+      if (!url) return url;
+      if (!this.claim) return url;
+      const sep = url.includes('?') ? '&' : '?';
+      return `${url}${sep}c=${encodeURIComponent(this.claim)}`;
     },
 
     async checkPayment() {
@@ -246,8 +274,8 @@ window.app = Vue.createApp({
           this.paid = true;
           this.expired = !!data.expired;
           this.remembers = data.remembers;
-          this.contentUrl = data.url;
-          this.onionUrl = data.onion_url || null;
+          this.contentUrl = this.withClaim(data.url);
+          this.onionUrl = this.withClaim(data.onion_url || null);
           this.releaseDelaySeconds = data.release_delay_seconds || 0;
           this.contentUnlocked = data.content_unlocked !== false;
           this.unlockInSeconds = data.unlock_in_seconds || 0;

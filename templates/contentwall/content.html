@@ -179,7 +179,7 @@
               <span class="text-caption q-ml-sm">{{ (f.size / 1024) | round(1) }} KB</span>
             </div>
             <q-btn outline color="orange" size="sm" no-caps icon="download"
-              href="/contentwall/api/v1/items/file/{{ item_id }}/{{ f.id }}?payment_hash={{ payment_hash }}&t={{ access_token }}"
+              href="/contentwall/api/v1/items/file/{{ item_id }}/{{ f.id }}?payment_hash={{ payment_hash }}&t={{ access_token }}&c={{ claim }}"
               download
             >Download</q-btn>
           </div>
@@ -230,6 +230,7 @@
 const ITEM_ID      = "{{ item_id }}";
 const PAYMENT_HASH = "{{ payment_hash }}";
 const ACCESS_TOKEN = "{{ access_token }}";
+const CLAIM = "{{ claim }}";
 
 function cwHandleImgError(imgEl) {
   imgEl.style.display = 'none';
@@ -246,7 +247,8 @@ window.cwImgDiag = async function() {
     const r = await fetch(
       `/contentwall/api/v1/items/${ITEM_ID}/diagnostic` +
       `?payment_hash=${encodeURIComponent(PAYMENT_HASH)}` +
-      `&t=${encodeURIComponent(ACCESS_TOKEN)}`
+      `&t=${encodeURIComponent(ACCESS_TOKEN)}` +
+      `&c=${encodeURIComponent(CLAIM)}`
     );
     const data = await r.json();
     out.textContent = JSON.stringify(data, null, 2);

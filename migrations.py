@@ -1,6 +1,23 @@
 from lnbits.db import Connection
 
 
+async def _create_index(
+    db: Connection, name: str, table: str, columns: str, unique: bool = False
+) -> None:
+    """
+    Cross-DB CREATE INDEX. SQLite (ATTACHed ext DB) needs the schema on the
+    index name, Postgres needs it on the table name. The old form
+    (schema on the table) is a syntax error on SQLite, which aborted m001 and
+    silently left the UNIQUE index on payments(item_id, payment_hash) missing.
+    """
+    kind = "UNIQUE INDEX" if unique else "INDEX"
+    if db.type == "SQLITE":
+        sql = f"CREATE {kind} IF NOT EXISTS contentwall.{name} ON {table}({columns});"
+    else:
+        sql = f"CREATE {kind} IF NOT EXISTS {name} ON contentwall.{table}({columns});"
+    await db.execute(sql)
+
+
 async def m001_initial(db: Connection):
     """Initial schema (idempotent)."""
     await db.execute(
@@ -23,10 +40,7 @@ async def m001_initial(db: Connection):
         );
         """
     )
-    await db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_contentwall_items_wallet "
-        "ON contentwall.items(wallet);"
-    )
+    await _create_index(db, "idx_contentwall_items_wallet", "items", "wallet")
 
     await db.execute(
         f"""
@@ -40,9 +54,9 @@ async def m001_initial(db: Connection):
         );
         """
     )
-    await db.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_contentwall_payments_hash "
-        "ON contentwall.payments(item_id, payment_hash);"
+    await _create_index(
+        db, "idx_contentwall_payments_hash", "payments", "item_id, payment_hash",
+        unique=True,
     )
 
 
@@ -122,9 +136,8 @@ async def m002_extended_fields(db: Connection):
         );
         """
     )
-    await db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_contentwall_files_item "
-        "ON contentwall.item_files(item_id, position);"
+    await _create_index(
+        db, "idx_contentwall_files_item", "item_files", "item_id, position"
     )
 
 
@@ -156,9 +169,8 @@ async def m003_distribution_features(db: Connection):
         );
         """
     )
-    await db.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_contentwall_coupons_code "
-        "ON contentwall.coupons(item_id, code);"
+    await _create_index(
+        db, "idx_contentwall_coupons_code", "coupons", "item_id, code", unique=True
     )
 
     await db.execute(
@@ -174,7 +186,15 @@ async def m003_distribution_features(db: Connection):
         );
         """
     )
-    await db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_contentwall_tips_item "
-        "ON contentwall.tips(item_id);"
-    )
+    await _create_index(db, "idx_contentwall_tips_item", "tips", "item_id")
+
+
+async def m004_claim_secret(db: Connection):
+    """
+    v1.2.13 security hardening: per-payment claim secret.
+
+    Access is now gated on a bearer secret handed only to the buyer, not on
+    knowledge of the payment_hash (which leaks through URLs and logs). We store
+    only its sha256 so the DB never holds the secret itself.
+    """
+    await _add_column_if_missing(db, "payments", "claim_hash", "TEXT")

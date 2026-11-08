@@ -8,8 +8,6 @@ like `/embed/<id>` or `/me/purchases`.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-
 from fastapi import APIRouter, Depends
 from fastapi.exceptions import HTTPException
 from fastapi.requests import Request
@@ -21,11 +19,6 @@ from .crud import (
     get_article_content,
     get_item,
     get_item_files,
-    has_paid,
-    increment_view_count,
-    is_payment_expired,
-    record_payment,
-    verify_access_token,
 )
 from .helpers import render_markdown_safe
 from .models import PublicItem
@@ -117,85 +110,21 @@ async def view_content(
     item_id: str,
     payment_hash: str | None = None,
     t: str | None = None,
+    c: str | None = None,
 ):
     item = await get_item(item_id)
     if not item:
         raise HTTPException(status_code=404, detail="Content not found")
 
-    if item.scheduled_at:
-        scheduled = datetime.fromisoformat(
-            item.scheduled_at.replace("Z", "+00:00")
-        )
-        if datetime.now(timezone.utc) < scheduled:
-            raise HTTPException(status_code=403, detail="Not yet available")
-
-    has_access = False
-    payment_ts = None
-
-    if payment_hash:
-        if item.access_signing_key and t:
-            if not verify_access_token(
-                item.access_signing_key, item_id, payment_hash, t
-            ):
-                raise HTTPException(status_code=403, detail="Invalid token")
-
-        from lnbits.core.crud import get_standalone_payment
-        from lnbits.core.services import check_transaction_status
-
-        try:
-            status = await check_transaction_status(item.wallet, payment_hash)
-            if not status.pending:
-                payment = await get_standalone_payment(
-                    checking_id_or_hash=payment_hash,
-                    incoming=True,
-                    wallet_id=item.wallet,
-                )
-                if (
-                    payment
-                    and payment.extra.get("tag") == "contentwall"
-                    and payment.extra.get("id") == item_id
-                ):
-                    has_access = True
-                    await record_payment(
-                        item_id,
-                        payment_hash,
-                        int(payment.amount / 1000),
-                        access_duration_seconds=item.access_duration_seconds
-                        or 0,
-                    )
-        except Exception:
-            pass
-
-        if not has_access:
-            has_access = await has_paid(item_id, payment_hash)
-            if has_access:
-                from .crud import get_payment_timestamp
-                payment_ts = await get_payment_timestamp(item_id, payment_hash)
-
-    if not has_access:
+    if not payment_hash:
         raise HTTPException(status_code=403, detail="Payment required")
 
-    release_delay = item.release_delay_seconds or 0
-    if release_delay > 0 and payment_ts:
-        paid_at = datetime.fromisoformat(payment_ts.replace("Z", "+00:00"))
-        elapsed = (datetime.now(timezone.utc) - paid_at).total_seconds()
-        remaining = release_delay - int(elapsed)
-        if remaining > 0:
-            raise HTTPException(
-                status_code=403,
-                detail=f"Content available in {remaining}s",
-            )
+    # Single shared gate: schedule, credentialed payment, release delay, rental
+    # expiry and the per-view cap (this HTML view consumes one view). Mirrors
+    # the JSON/content API exactly so there's one authorization path.
+    from .views_api import _gate_access
 
-    if await is_payment_expired(item_id, payment_hash):
-        raise HTTPException(status_code=410, detail="Access has expired")
-
-    if item.max_views and item.max_views > 0:
-        new_count = await increment_view_count(item_id, payment_hash)
-        if new_count > item.max_views:
-            raise HTTPException(
-                status_code=410,
-                detail=f"View limit reached ({item.max_views})",
-            )
+    await _gate_access(item, item_id, payment_hash, t or "", c or "", count_view=True)
 
     article_content = None
     article_html = None
@@ -216,7 +145,7 @@ async def view_content(
         # applies the per-buyer watermark (PIL permitting).
         image_url = (
             f"/contentwall/api/v1/items/image/{item_id}"
-            f"?payment_hash={payment_hash}&t={t or ''}"
+            f"?payment_hash={payment_hash}&t={t or ''}&c={c or ''}"
         )
     elif item.content_type == "bundle":
         bundle_files = [
@@ -235,7 +164,7 @@ async def view_content(
             media_mime = info["content_type"]
             media_url = (
                 f"/contentwall/api/v1/items/media/{item_id}"
-                f"?payment_hash={payment_hash}&t={t or ''}"
+                f"?payment_hash={payment_hash}&t={t or ''}&c={c or ''}"
             )
         if get_thumbnail_path(item_id):
             thumbnail_url = f"/contentwall/api/v1/items/{item_id}/thumbnail"
@@ -258,6 +187,7 @@ async def view_content(
             "thumbnail_url": thumbnail_url,
             "payment_hash": payment_hash,
             "access_token": t or "",
+            "claim": c or "",
             "allow_tips": bool(item.allow_tips),
         },
     )
